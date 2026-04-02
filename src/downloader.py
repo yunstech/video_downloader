@@ -15,8 +15,12 @@ from src.video_downloader import (
     download_m3u8_native,
     download_direct,
     generate_filename,
+    VIDEO_EXTENSIONS,
 )
 from src import config
+
+# Extensions/patterns that identify a URL as a direct video (skip scraping)
+DIRECT_VIDEO_PATTERNS = (".m3u8", ".mp4", ".webm", ".mkv", ".ts", ".avi", ".flv", ".mov")
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,43 @@ def download_video(
                 progress_callback(text)
             except Exception:
                 pass  # Don't let callback errors break the download
+
+    # ── Direct video URL fast-path (skip page scraping) ─────────────────
+    url_lower = url.lower().split("?")[0]
+    is_direct = any(url_lower.endswith(ext) for ext in DIRECT_VIDEO_PATTERNS)
+
+    if is_direct:
+        _update("🎯 Direct video URL detected, skipping page scrape...")
+        unique_prefix = uuid.uuid4().hex[:8]
+        filename = f"{unique_prefix}_{generate_filename(url)}"
+        output_path = os.path.join(download_dir, filename)
+
+        if ".m3u8" in url.lower():
+            if not output_path.lower().endswith((".mp4", ".ts")):
+                output_path = os.path.splitext(output_path)[0] + ".mp4"
+            _update("⬇️ Downloading HLS stream...")
+            success = download_m3u8_native(
+                url, output_path, url, session=None, workers=workers
+            )
+        else:
+            _update("⬇️ Downloading video...")
+            download_direct(url, output_path, url, session=None)
+            success = True
+
+        if not success or not os.path.exists(output_path):
+            ts_path = os.path.splitext(output_path)[0] + ".ts"
+            if os.path.exists(ts_path):
+                output_path = ts_path
+            else:
+                raise RuntimeError("Download completed but output file not found.")
+
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        _update(f"✅ Download complete! ({size_mb:.1f} MB)")
+        return {
+            "filepath": output_path,
+            "filename": os.path.basename(output_path),
+            "size_mb": round(size_mb, 2),
+        }
 
     # ── Step 1: Fetch the page ───────────────────────────────────────────
     html = None
