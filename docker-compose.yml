@@ -18,10 +18,10 @@ services:
       --http-port=8081
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8081/ || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 60s
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
 
   redis:
     image: redis:7-alpine
@@ -42,7 +42,7 @@ services:
       redis:
         condition: service_healthy
       telegram-bot-api:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - downloads:/app/downloads
     restart: unless-stopped
