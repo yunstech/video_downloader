@@ -1,8 +1,8 @@
-version: "3.8"
-
 services:
   telegram-bot-api:
-    image: ghcr.io/tdlib/telegram-bot-api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.botapi
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
@@ -10,13 +10,19 @@ services:
       - telegram-bot-api-data:/var/lib/telegram-bot-api
       - downloads:/app/downloads
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     restart: unless-stopped
     command: >
       --api-id=${TELEGRAM_API_ID}
       --api-hash=${TELEGRAM_API_HASH}
       --local
       --http-port=8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   redis:
     image: redis:7-alpine
@@ -37,7 +43,7 @@ services:
       redis:
         condition: service_healthy
       telegram-bot-api:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - downloads:/app/downloads
     restart: unless-stopped
