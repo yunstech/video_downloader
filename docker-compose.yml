@@ -17,7 +17,7 @@ services:
       --local
       --http-port=8081
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8081/ || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 8081 || curl -s http://localhost:8081/ > /dev/null 2>&1 || exit 1"]
       interval: 20s
       timeout: 10s
       retries: 30

@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     zlib1g \
     curl \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/telegram-bot-api/install/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
