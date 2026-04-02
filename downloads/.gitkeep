@@ -1,0 +1,2 @@
+# downloads directory - temp files are stored here during processing
+# this directory is mounted as a Docker volume

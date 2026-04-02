@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+# Install system deps: ffmpeg for HLS muxing, curl for healthchecks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ src/
+
+RUN mkdir -p /app/downloads
+
+ENV PYTHONUNBUFFERED=1
+
+# Default: run bot (override in compose for worker)
+CMD ["python", "-m", "src.bot"]

@@ -1,0 +1,70 @@
+version: "3.8"
+
+services:
+  telegram-bot-api:
+    image: ghcr.io/tdlib/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+      - downloads:/app/downloads
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+    command: >
+      --api-id=${TELEGRAM_API_ID}
+      --api-hash=${TELEGRAM_API_HASH}
+      --local
+      --http-port=8081
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  bot:
+    build: .
+    command: python -m src.bot
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      telegram-bot-api:
+        condition: service_started
+    volumes:
+      - downloads:/app/downloads
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} video-downloads
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - downloads:/app/downloads
+    # Scale workers: docker compose up --scale worker=3
+    restart: unless-stopped
+
+  # Optional: RQ Dashboard for monitoring
+  # rq-dashboard:
+  #   image: eoranged/rq-dashboard
+  #   environment:
+  #     RQ_DASHBOARD_REDIS_URL: redis://redis:6379/0
+  #   ports:
+  #     - "9181:9181"
+  #   depends_on:
+  #     - redis
+
+volumes:
+  telegram-bot-api-data:
+  redis-data:
+  downloads:

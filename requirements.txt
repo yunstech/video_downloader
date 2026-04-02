@@ -1,0 +1,8 @@
+python-telegram-bot[ext]==21.*
+rq>=1.16
+redis>=5.0
+curl_cffi>=0.7
+beautifulsoup4
+tqdm
+pycryptodome
+requests
