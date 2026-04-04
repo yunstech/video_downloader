@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) -> dict | None:
     """
     Download a Twitter/X video via twittervideodownloader.com.
-    Scrapes the download page to get the real CDN video URL, then downloads it.
+    Properly handles Django CSRF + gql token, picks highest quality mp4.
     """
     import re
     import requests as req
@@ -59,7 +59,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
     _update("🐦 Fetching video link via twittervideodownloader.com...")
 
     try:
-        # Step 1: POST the Twitter URL to the downloader service
+        session = req.Session()
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -68,75 +68,73 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
             ),
             "Referer": "https://twittervideodownloader.com/",
             "Origin": "https://twittervideodownloader.com",
-            "Content-Type": "application/x-www-form-urlencoded",
         }
 
-        # Get the page first to extract any CSRF token
-        session = req.Session()
-        page_resp = session.get("https://twittervideodownloader.com/", headers=headers, timeout=15)
-
-        # Extract CSRF / nonce token if present
-        csrf_token = ""
-        csrf_match = re.search(
-            r'<input[^>]+name=["\']_?(?:token|csrf|nonce)["\'][^>]+value=["\']([^"\']+)["\']',
-            page_resp.text, re.IGNORECASE
+        # Step 1: GET homepage to obtain session cookie + form tokens
+        page_resp = session.get(
+            "https://twittervideodownloader.com/", headers=headers, timeout=15
         )
-        if csrf_match:
-            csrf_token = csrf_match.group(1)
+        page_resp.raise_for_status()
 
-        post_data = {"tweet": url}
-        if csrf_token:
-            post_data["token"] = csrf_token
+        # Extract ALL hidden form fields (csrfmiddlewaretoken + gql)
+        tokens = {
+            k: v for k, v in re.findall(
+                r'<input[^>]+name=["\']([^"\']+)["\'][^>]+value=["\']([^"\']*)["\']',
+                page_resp.text
+            )
+        }
+        if not tokens.get("csrfmiddlewaretoken"):
+            logger.warning("twittervideodownloader.com: no CSRF token found")
+            return None
+
+        # Step 2: POST tweet URL with all tokens
+        post_headers = {
+            **headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRFToken": tokens["csrfmiddlewaretoken"],
+        }
+        post_data = {"tweet": url, **tokens}
 
         resp = session.post(
             "https://twittervideodownloader.com/download",
             data=post_data,
-            headers=headers,
+            headers=post_headers,
             timeout=20,
         )
+        resp.raise_for_status()
 
-        if not resp.ok:
-            logger.warning(f"twittervideodownloader.com returned {resp.status_code}")
-            return None
-
-        html = resp.text
-
-        # Step 2: Extract video download links from the response
-        # Look for direct mp4 links — prefer highest quality
+        # Step 3: Extract all video.twimg.com mp4 links from href attributes
         video_links = re.findall(
-            r'href=["\']( https?://[^"\']+\.mp4[^"\']*)["\']',
-            html, re.IGNORECASE
+            r'href=["\']( https?://video\.twimg\.com/[^"\']+\.mp4[^"\']*)["\']|'
+            r'href=["\'](https?://video\.twimg\.com/[^"\']+\.mp4[^"\']*)["\']',
+            resp.text, re.IGNORECASE
         )
-        # Also try without .mp4 suffix (CDN links)
-        if not video_links:
-            video_links = re.findall(
-                r'href=["\']( https?://(?:video|pbs)\.twimg\.com/[^"\']+)["\']',
-                html, re.IGNORECASE
-            )
-        # Broader match — any download button link
-        if not video_links:
-            video_links = re.findall(
-                r'href=["\']( https?://[^"\']+(?:video|mp4|twimg)[^"\']*)["\']',
-                html, re.IGNORECASE
-            )
-        # Strip leading spaces from regex capture
-        video_links = [v.strip() for v in video_links]
+        # Flatten and clean
+        links = [
+            (a or b).strip()
+            for a, b in video_links
+            if (a or b).strip()
+        ]
 
-        if not video_links:
-            logger.warning("twittervideodownloader.com: no video links found in response")
+        if not links:
+            logger.warning("twittervideodownloader.com: no video links in response")
             return None
 
-        # Pick the first (usually highest quality) link
-        chosen = video_links[0]
-        logger.info(f"twittervideodownloader.com link: {chosen[:100]}")
+        # Pick highest quality = last link (they're ordered low → high)
+        chosen = links[-1]
+        logger.info(f"Downloading ({len(links)} qualities, best): {chosen[:100]}")
+        _update(f"⬇️ Downloading Twitter video ({len(links)} qualities available)...")
 
-        # Step 3: Download the video
-        _update("⬇️ Downloading Twitter/X video...")
-        dl_headers = {
-            "User-Agent": headers["User-Agent"],
-            "Referer": "https://twittervideodownloader.com/",
-        }
-        dl_resp = session.get(chosen, headers=dl_headers, stream=True, timeout=120)
+        # Step 4: Download the mp4
+        dl_resp = session.get(
+            chosen,
+            headers={
+                "User-Agent": headers["User-Agent"],
+                "Referer": "https://twittervideodownloader.com/",
+            },
+            stream=True,
+            timeout=120,
+        )
         dl_resp.raise_for_status()
 
         with open(output_path, "wb") as f:
