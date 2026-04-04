@@ -163,7 +163,14 @@ def fetch_with_playwright(url):
 
     print("  🌐 Launching headless Chromium...")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",  # Disable sandbox (safe in Docker)
+                "--disable-gpu",  # No GPU in container
+                "--disable-dev-shm-usage",  # Use disk instead of /dev/shm for large pages
+            ],
+        )
         context = browser.new_context(
             user_agent=COMMON_HEADERS["User-Agent"],
             viewport={"width": 1920, "height": 1080},

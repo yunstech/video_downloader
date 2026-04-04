@@ -45,6 +45,9 @@ services:
         condition: service_started
     volumes:
       - downloads:/app/downloads
+      - /dev/shm:/dev/shm
+    mem_limit: 1g
+    memswap_limit: 1g
     restart: unless-stopped
 
   worker:
@@ -56,6 +59,9 @@ services:
         condition: service_healthy
     volumes:
       - downloads:/app/downloads
+      - /dev/shm:/dev/shm
+    mem_limit: 1g
+    memswap_limit: 1g
     # Scale workers: docker compose up --scale worker=3
     restart: unless-stopped
 
