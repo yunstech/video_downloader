@@ -14,6 +14,7 @@ import requests
 
 from src import config
 from src.downloader import download_video
+from src.converter import convert_ts_to_mp4
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,20 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
         size_mb = result["size_mb"]
 
         logger.info(f"Downloaded: {filepath} ({size_mb:.1f} MB)")
+
+        # ── Convert .ts → .mp4 if needed ─────────────────────────────────
+        if filepath.lower().endswith(".ts"):
+            _edit_message(chat_id, status_message_id, "🔄 Converting .ts → .mp4...")
+            mp4_path = convert_ts_to_mp4(
+                filepath,
+                progress_callback=progress_callback,
+            )
+            if mp4_path:
+                filepath = mp4_path
+                size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                logger.info(f"Converted to: {filepath} ({size_mb:.1f} MB)")
+            else:
+                logger.warning("Conversion failed, uploading .ts file as-is")
 
         # ── Check file size ──────────────────────────────────────────────
         if size_mb > config.MAX_FILE_SIZE_MB:

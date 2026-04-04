@@ -52,3 +52,7 @@ logging.basicConfig(
 # ── Rate Limiting ────────────────────────────────────────────────────────────
 
 MAX_JOBS_PER_USER = int(os.getenv("MAX_JOBS_PER_USER", "3"))
+
+# ── ConvertHub API (ts → mp4 conversion) ────────────────────────────────────
+
+CONVERTHUB_API_KEY = os.getenv("CONVERTHUB_API_KEY", "")
