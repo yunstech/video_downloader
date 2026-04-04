@@ -135,9 +135,12 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
     start_time = time.time()
     filepath = None
 
+    logger.info(f"[TASK START] url={url} chat_id={chat_id} status_msg={status_message_id}")
+
     try:
         # ── Download ─────────────────────────────────────────────────────
         def progress_callback(text: str):
+            logger.debug(f"[PROGRESS] {text}")
             _edit_message(chat_id, status_message_id, text)
 
         _edit_message(chat_id, status_message_id, "⬇️ Downloading video...")
@@ -168,7 +171,9 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
                     "-movflags", "+faststart",
                     mp4_path,
                 ]
+                logger.debug(f"ffmpeg cmd: {' '.join(cmd)}")
                 result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                logger.debug(f"ffmpeg returncode={result_proc.returncode} stderr={result_proc.stderr[:300]!r}")
                 if result_proc.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
                     logger.info(f"ffmpeg converted: {filepath} → {mp4_path}")
                     try:

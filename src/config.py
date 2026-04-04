@@ -41,13 +41,20 @@ ALLOWED_USERS: set[int] = (
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=getattr(logging, LOG_LEVEL.upper(), logging.DEBUG),
+    format="%(asctime)s [%(levelname)-8s] %(name)s (%(funcName)s:%(lineno)d): %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# Keep noisy third-party libraries at WARNING to avoid log spam
+for _noisy in ("httpx", "httpcore", "urllib3", "telegram", "apscheduler",
+               "hpack", "h2", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+# yt-dlp logs go to DEBUG (visible when LOG_LEVEL=DEBUG, silenced otherwise)
+logging.getLogger("yt_dlp").setLevel(logging.DEBUG)
 
 # ── Rate Limiting ────────────────────────────────────────────────────────────
 

@@ -71,9 +71,11 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
         }
 
         # Step 1: GET homepage to obtain session cookie + form tokens
+        logger.debug("GET https://twittervideodownloader.com/")
         page_resp = session.get(
             "https://twittervideodownloader.com/", headers=headers, timeout=15
         )
+        logger.debug(f"Homepage status: {page_resp.status_code}, cookies: {dict(session.cookies)}")
         page_resp.raise_for_status()
 
         # Extract ALL hidden form fields (csrfmiddlewaretoken + gql)
@@ -83,6 +85,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
                 page_resp.text
             )
         }
+        logger.debug(f"Form tokens found: {list(tokens.keys())}")
         if not tokens.get("csrfmiddlewaretoken"):
             logger.warning("twittervideodownloader.com: no CSRF token found")
             return None
@@ -94,6 +97,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
             "X-CSRFToken": tokens["csrfmiddlewaretoken"],
         }
         post_data = {"tweet": url, **tokens}
+        logger.debug(f"POST /download with tweet={url}, token_keys={list(tokens.keys())}")
 
         resp = session.post(
             "https://twittervideodownloader.com/download",
@@ -101,6 +105,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
             headers=post_headers,
             timeout=20,
         )
+        logger.debug(f"POST status: {resp.status_code}, final_url: {resp.url}")
         resp.raise_for_status()
 
         # Step 3: Extract all video.twimg.com mp4 links from href attributes
@@ -115,6 +120,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
             for a, b in video_links
             if (a or b).strip()
         ]
+        logger.debug(f"Extracted {len(links)} video link(s): {links}")
 
         if not links:
             logger.warning("twittervideodownloader.com: no video links in response")
@@ -126,6 +132,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
         _update(f"⬇️ Downloading Twitter video ({len(links)} qualities available)...")
 
         # Step 4: Download the mp4
+        logger.debug(f"GET video: {chosen[:120]}")
         dl_resp = session.get(
             chosen,
             headers={
@@ -135,12 +142,16 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
             stream=True,
             timeout=120,
         )
+        logger.debug(f"Video download status: {dl_resp.status_code}, content-type: {dl_resp.headers.get('content-type', '?')}")
         dl_resp.raise_for_status()
 
+        bytes_written = 0
         with open(output_path, "wb") as f:
             for chunk in dl_resp.iter_content(chunk_size=65536):
                 if chunk:
                     f.write(chunk)
+                    bytes_written += len(chunk)
+        logger.debug(f"Wrote {bytes_written / 1024 / 1024:.2f} MB to {output_path}")
 
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
@@ -151,7 +162,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
             }
 
     except Exception as e:
-        logger.warning(f"twittervideodownloader.com failed: {e}")
+        logger.warning(f"twittervideodownloader.com failed: {e}", exc_info=True)
 
     return None
 
@@ -175,15 +186,38 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
 
     # Remove extension — yt-dlp adds its own
     output_template = os.path.splitext(output_path)[0] + ".%(ext)s"
+    logger.debug(f"yt-dlp output template: {output_template}")
+
+    def _ytdlp_progress_hook(d):
+        status = d.get("status", "?")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            downloaded = d.get("downloaded_bytes", 0)
+            speed = d.get("speed") or 0
+            eta = d.get("eta") or 0
+            pct = (downloaded / total * 100) if total else 0
+            logger.debug(
+                f"yt-dlp downloading: {pct:.1f}% "
+                f"({downloaded // 1024 // 1024} MB / {total // 1024 // 1024} MB) "
+                f"speed={speed // 1024:.0f} KB/s eta={eta}s"
+            )
+        elif status == "finished":
+            fname = d.get("filename", "?")
+            logger.debug(f"yt-dlp finished fragment/file: {fname}")
+        elif status == "error":
+            logger.warning(f"yt-dlp hook reported error: {d}")
 
     ydl_opts = {
         "outtmpl": output_template,
         "format": "best[ext=mp4]/best",
         "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
+        "noprogress": True,
         "socket_timeout": 30,
         "retries": 3,
+        "progress_hooks": [_ytdlp_progress_hook],
+        "logger": logging.getLogger("yt_dlp"),
     }
 
     # Use cookies file for Twitter/X if available (needed for auth-gated content)
@@ -197,12 +231,22 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.debug(f"yt-dlp extract_info start: {url}")
             info = ydl.extract_info(url, download=True)
             if info is None:
+                logger.warning("yt-dlp: extract_info returned None")
                 return None
+
+            logger.debug(
+                f"yt-dlp info: extractor={info.get('extractor','?')} "
+                f"title={str(info.get('title','?'))[:60]} "
+                f"ext={info.get('ext','?')} "
+                f"format={info.get('format','?')}"
+            )
 
             # Find the downloaded file
             filename = ydl.prepare_filename(info)
+            logger.debug(f"yt-dlp prepare_filename: {filename}")
             # yt-dlp may change extension
             if not os.path.exists(filename):
                 # Try .mp4
@@ -212,18 +256,22 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
                 base = os.path.splitext(output_template.replace("%(ext)s", ""))[0]
                 import glob
                 matches = glob.glob(base + ".*")
+                logger.debug(f"yt-dlp glob search '{base}.*' found: {matches}")
                 if matches:
                     filename = matches[0]
 
             if os.path.exists(filename):
                 size_mb = os.path.getsize(filename) / (1024 * 1024)
+                logger.info(f"yt-dlp success: {filename} ({size_mb:.2f} MB)")
                 return {
                     "filepath": filename,
                     "filename": os.path.basename(filename),
                     "size_mb": round(size_mb, 2),
                 }
+            else:
+                logger.warning(f"yt-dlp: expected output file not found: {filename}")
     except Exception as e:
-        logger.warning(f"yt-dlp failed: {e}")
+        logger.warning(f"yt-dlp failed: {e}", exc_info=True)
 
     return None
 
@@ -254,6 +302,8 @@ def download_video(
     download_dir = download_dir or config.DOWNLOAD_DIR
     os.makedirs(download_dir, exist_ok=True)
 
+    logger.debug(f"download_video called: url={url}, method={method}, workers={workers}")
+
     def _update(text: str):
         logger.info(text)
         if progress_callback:
@@ -265,6 +315,7 @@ def download_video(
     # ── Direct video URL fast-path (skip page scraping) ─────────────────
     url_lower = url.lower().split("?")[0]
     is_direct = any(url_lower.endswith(ext) for ext in DIRECT_VIDEO_PATTERNS)
+    logger.debug(f"is_direct={is_direct}, url_lower={url_lower}")
 
     if is_direct:
         _update("🎯 Direct video URL detected, skipping page scrape...")
@@ -302,6 +353,7 @@ def download_video(
     # ── Twitter/X: use twittervideodownloader.com ────────────────────────
     from urllib.parse import urlparse
     domain = urlparse(url).netloc.lower().replace("www.", "")
+    logger.debug(f"Parsed domain: {domain}")
 
     if any(d in domain for d in TWITTER_DOMAINS):
         _update("🐦 Twitter/X URL detected, trying yt-dlp...")
@@ -311,12 +363,13 @@ def download_video(
         if result:
             _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
             return result
-        _update("⚠️ yt-dlp failed, trying twittervideodownloader.com...")
-        result = _try_twitter_downloader(url, output_path, progress_callback=_update)
-        if result:
-            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
-            return result
-        _update("⚠️ All Twitter methods failed, trying page scraping...")
+        # yt-dlp failed (usually needs login) — raise a helpful error immediately.
+        # Playwright/scraper cannot handle Twitter's JS-heavy auth wall either.
+        raise RuntimeError(
+            "Twitter/X video download failed.\n\n"
+            "Twitter requires login to access most videos.\n"
+            "👉 Place a twitter_cookies.txt (Netscape format) in the bot's data directory to enable downloads."
+        )
 
     # ── Try yt-dlp for other known platforms (YouTube, Instagram, etc.) ──
     elif any(d in domain for d in YTDLP_PREFERRED_DOMAINS):
@@ -328,6 +381,8 @@ def download_video(
             _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
             return result
         _update("⚠️ yt-dlp failed, falling back to page scraping...")
+    else:
+        logger.debug(f"Domain '{domain}' not in Twitter or preferred yt-dlp list, using scraper")
 
     # ── Step 1: Fetch the page ───────────────────────────────────────────
     html = None
@@ -340,11 +395,18 @@ def download_video(
         result = fetch_with_playwright(url)
         if result:
             html, network_urls = result
+            logger.debug(f"Playwright: got {len(html)} chars HTML, {len(network_urls)} network URLs captured")
+        else:
+            logger.debug("Playwright: returned no result")
 
     # Fallback to curl_cffi if Playwright fails
     if html is None and method in ("auto", "curl_cffi"):
         _update("🌐 Fetching page with curl_cffi (TLS impersonation)...")
         html, session = fetch_with_curl_cffi(url)
+        if html:
+            logger.debug(f"curl_cffi: got {len(html)} chars HTML")
+        else:
+            logger.debug("curl_cffi: returned no HTML")
 
     if html is None:
         raise RuntimeError(
@@ -355,24 +417,30 @@ def download_video(
     # ── Step 2: Extract video URLs ───────────────────────────────────────
     _update("🔎 Scanning page for video URLs...")
     video_urls = extract_video_urls(html, url)
+    logger.debug(f"extract_video_urls returned {len(video_urls)} URL(s): {[(s, u[:80]) for s, u in video_urls]}")
 
     # Prepend network-captured URLs (from Playwright)
     for nurl in network_urls:
         if nurl not in [u for _, u in video_urls]:
             video_urls.insert(0, ("network-capture", nurl))
+    logger.debug(f"After network-capture merge: {len(video_urls)} URL(s) total")
 
     downloadable = [(s, u) for s, u in video_urls if s != "iframe"]
+    logger.debug(f"Downloadable (non-iframe): {len(downloadable)} — {[(s, u[:80]) for s, u in downloadable]}")
 
     # Try iframes if no direct URLs found
     if not downloadable:
         iframes = [(s, u) for s, u in video_urls if s == "iframe"]
+        logger.debug(f"No direct URLs; checking {len(iframes)} iframe(s)")
         for _, iframe_url in iframes:
             logger.info(f"Checking iframe: {iframe_url[:80]}...")
             try:
                 if session:
                     resp = session.get(iframe_url, timeout=15)
+                    logger.debug(f"Iframe fetch status: {resp.status_code}")
                     if resp.status_code == 200:
                         extra = extract_video_urls(resp.text, iframe_url)
+                        logger.debug(f"Iframe yielded {len(extra)} extra URL(s)")
                         downloadable.extend(
                             [(s, u) for s, u in extra if s != "iframe"]
                         )
