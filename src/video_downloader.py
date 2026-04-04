@@ -368,7 +368,8 @@ def extract_video_urls(html, base_url):
         r'''"(?:url|src|file|source|video|mp4|hls|stream)"\s*:\s*"(https?://[^"]+)"''',
         r'''video\.src\s*=\s*["'](https?://[^"']+)["']''',
         r'''(?:loadVideo|playVideo|initPlayer|setSource)\s*\(\s*["'](https?://[^"']+)["']''',
-        r'''(https?:\\?/\\?/[^"'\s\\]+\.(?:mp4|m3u8)[^"'\s\\]*)''',
+        # JS-escaped URLs with \/ (common in inline JSON and JS strings)
+        r'''["'](https?:[^"'\s]+\.(?:mp4|m3u8)(?:[^"'\s]*))["']''',
         # Twitter/X video CDN
         r'''(https?://video\.twimg\.com/[^"'\s]+)''',
     ]
