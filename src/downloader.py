@@ -608,6 +608,12 @@ def _download_m3u8_ffmpeg(
     cmd = [
         ffmpeg_path,
         "-y",  # overwrite output
+        # Essential for HLS streams — allow all required protocols
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        # Handle connection drops (common with CDN-served HLS)
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
     ]
 
     # Add headers
@@ -618,6 +624,7 @@ def _download_m3u8_ffmpeg(
     )
     if referer:
         headers_str += f"Referer: {referer}\r\n"
+        headers_str += f"Origin: {referer.rstrip('/')}\r\n"
 
     cmd.extend([
         "-headers", headers_str,
@@ -625,6 +632,7 @@ def _download_m3u8_ffmpeg(
         "-c", "copy",           # no re-encoding, just copy streams
         "-bsf:a", "aac_adtstoasc",  # fix AAC stream for mp4 container
         "-movflags", "+faststart",   # enable streaming-friendly mp4
+        "-max_muxing_queue_size", "1024",  # prevent queue overflow on long videos
         "-loglevel", "warning",
         output_path,
     ])
@@ -636,8 +644,11 @@ def _download_m3u8_ffmpeg(
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,  # 5 minute timeout
+            timeout=600,  # 10 minute timeout for long videos
         )
+
+        if result.stderr:
+            logger.debug(f"ffmpeg stderr: {result.stderr.strip()[:500]}")
 
         if result.returncode != 0:
             stderr = result.stderr.strip()
@@ -659,7 +670,7 @@ def _download_m3u8_ffmpeg(
             return False
 
     except subprocess.TimeoutExpired:
-        logger.warning("ffmpeg timed out after 300s")
+        logger.warning("ffmpeg timed out after 600s")
         if os.path.exists(output_path):
             os.remove(output_path)
         return False
@@ -963,7 +974,19 @@ def download_video(
             return result
         _update("⚠️ yt-dlp failed, falling back to page scraping...")
     else:
-        logger.debug(f"Domain '{domain}' not in any preferred list, using scraper")
+        # ── Unknown site: try yt-dlp first (supports 1000+ sites) ────────
+        _update("🎬 Trying yt-dlp...")
+        logger.info(f"Unknown domain '{domain}', trying yt-dlp first")
+        unique_prefix = uuid.uuid4().hex[:8]
+        output_path = os.path.join(download_dir, f"{unique_prefix}_video.mp4")
+        try:
+            result = _try_ytdlp(url, output_path, progress_callback=_update)
+            if result:
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
+        except Exception as e:
+            logger.info(f"yt-dlp failed for {domain}: {e}")
+        _update("⚠️ yt-dlp failed, falling back to page scraping...")
 
     # ── Step 1: Fetch the page ───────────────────────────────────────────
     html = None
