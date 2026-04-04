@@ -568,6 +568,81 @@ def _download_direct_with_headers(
     return None
 
 
+def _extract_pornhub_video_urls(html: str) -> list:
+    """
+    Extract video URLs from PornHub's JavaScript flashvars/mediaDefinitions.
+    PornHub embeds the actual video URLs in JS variables, not in plain HTML.
+    Returns list of (quality, url) sorted by quality descending.
+    """
+    import re
+    import json
+
+    results = []
+
+    # Pattern 1: mediaDefinitions in flashvars
+    # Look for: "mediaDefinitions":[{...}]
+    media_match = re.search(
+        r'"mediaDefinitions"\s*:\s*(\[\{.*?\}\])',
+        html, re.DOTALL
+    )
+    if media_match:
+        try:
+            definitions = json.loads(media_match.group(1))
+            for item in definitions:
+                video_url = item.get("videoUrl") or item.get("url") or ""
+                quality = item.get("quality", "")
+                format_type = item.get("format", "")
+
+                # Skip empty URLs, HLS manifests (we want direct mp4)
+                if not video_url:
+                    continue
+                # Prefer mp4 over HLS
+                if format_type == "hls" or ".m3u8" in video_url:
+                    # Keep HLS as fallback but mark it
+                    results.append((f"hls-{quality}", video_url))
+                else:
+                    results.append((str(quality), video_url))
+
+            logger.info(f"PornHub JS: found {len(results)} mediaDefinition URL(s)")
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.debug(f"Failed to parse mediaDefinitions: {e}")
+
+    # Pattern 2: Direct quality URLs in flashvars
+    # Look for: "quality_720p":"https://..."
+    quality_matches = re.findall(
+        r'"quality_(\d+)p"\s*:\s*"(https?://[^"]+)"',
+        html
+    )
+    for quality, qurl in quality_matches:
+        if qurl not in [u for _, u in results]:
+            results.append((quality, qurl))
+
+    # Pattern 3: data-mediabook or similar attributes with video URLs
+    data_matches = re.findall(
+        r'data-mediabook=["\']([^"\']*phncdn\.com[^"\']*\.mp4[^"\']*)["\']',
+        html, re.IGNORECASE
+    )
+    for durl in data_matches:
+        if durl not in [u for _, u in results]:
+            results.append(("data-attr", durl))
+
+    if results:
+        # Sort: prefer mp4 over HLS, then by quality descending
+        def sort_key(item):
+            q, u = item
+            is_hls = q.startswith("hls-")
+            try:
+                num = int(q.replace("hls-", ""))
+            except ValueError:
+                num = 0
+            return (not is_hls, num)  # mp4 first, then highest quality
+
+        results.sort(key=sort_key, reverse=True)
+        logger.debug(f"PornHub JS sorted results: {[(q, u[:60]) for q, u in results]}")
+
+    return results
+
+
 def download_video(
     url: str,
     download_dir: str = None,
@@ -724,11 +799,21 @@ def download_video(
         result = _validate_downloaded_file(output_path)
         return result
 
-    # ── Adult sites: use Playwright scraper (yt-dlp grabs ads) ───────────
+    # ── Adult sites: yt-dlp first (knows JS video extraction), scraper fallback ─
     if any(d in domain for d in ADULT_PAGE_DOMAINS):
-        _update("🎬 Fetching video via browser...")
-        logger.info(f"Adult site detected ({domain}), using Playwright scraper (yt-dlp downloads ads)")
-        # Fall through directly to Step 1 (page scraping) below
+        _update("🎬 Detected adult site, extracting video...")
+        logger.info(f"Adult site detected ({domain}), trying yt-dlp (has native extractor)")
+        unique_prefix = uuid.uuid4().hex[:8]
+        output_path = os.path.join(download_dir, f"{unique_prefix}_video.mp4")
+        try:
+            result = _try_ytdlp(url, output_path, progress_callback=_update)
+            if result:
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
+        except Exception as e:
+            logger.warning(f"yt-dlp failed for adult site: {e}")
+        _update("⚠️ yt-dlp failed, falling back to page scraping...")
+        # Fall through to Step 1 (page scraping) below
 
     # ── Twitter/X: use yt-dlp ────────────────────────────────────────────
     elif any(d in domain for d in TWITTER_DOMAINS):
@@ -798,12 +883,58 @@ def download_video(
 
     # ── Step 2: Extract video URLs ───────────────────────────────────────
     _update("🔎 Scanning page for video URLs...")
+
+    # For adult sites, try extracting from JavaScript first (most reliable)
+    is_adult_page = any(d in domain for d in ADULT_PAGE_DOMAINS)
+    if is_adult_page:
+        js_urls = _extract_pornhub_video_urls(html)
+        if js_urls:
+            _update(f"🔎 Found {len(js_urls)} video URL(s) in page JavaScript")
+            # Use the best JS-extracted URL directly
+            best_quality, best_url = js_urls[0]
+            logger.info(f"Using JS-extracted URL (quality={best_quality}): {best_url[:100]}")
+
+            unique_prefix = uuid.uuid4().hex[:8]
+            filename = f"{unique_prefix}_{generate_filename(best_url)}"
+            output_path = os.path.join(download_dir, filename)
+
+            # Determine referer from CDN domain
+            cdn_domain = urlparse(best_url).netloc.lower()
+            referer = _get_cdn_referer(cdn_domain) or url
+
+            result = _download_direct_with_headers(
+                best_url, output_path, referer=referer, progress_callback=_update
+            )
+            if result:
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return _validate_downloaded_file(result["filepath"])
+
+            # If best URL failed, try remaining JS URLs
+            for quality, alt_url in js_urls[1:]:
+                if alt_url == best_url:
+                    continue
+                logger.info(f"Trying fallback JS URL (quality={quality}): {alt_url[:80]}")
+                alt_path = os.path.join(download_dir, f"{uuid.uuid4().hex[:8]}_{generate_filename(alt_url)}")
+                alt_referer = _get_cdn_referer(urlparse(alt_url).netloc.lower()) or url
+                result = _download_direct_with_headers(
+                    alt_url, alt_path, referer=alt_referer, progress_callback=_update
+                )
+                if result:
+                    _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                    return _validate_downloaded_file(result["filepath"])
+
+            logger.warning("All JS-extracted URLs failed, falling back to generic extraction")
+
     video_urls = extract_video_urls(html, url)
     logger.debug(f"extract_video_urls returned {len(video_urls)} URL(s): {[(s, u[:80]) for s, u in video_urls]}")
 
     # Prepend network-captured URLs (from Playwright)
+    # For adult sites, filter network URLs to avoid recommended video thumbnails
     for nurl in network_urls:
         if nurl not in [u for _, u in video_urls]:
+            if is_adult_page and _is_ad_url(nurl):
+                logger.debug(f"Skipping ad network URL: {nurl[:80]}")
+                continue
             video_urls.insert(0, ("network-capture", nurl))
     logger.debug(f"After network-capture merge: {len(video_urls)} URL(s) total")
 
