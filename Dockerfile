@@ -1,24 +1,18 @@
-FROM python:3.11-slim
+FROM buildpack-deps:bookworm
 
-# Install system deps: ffmpeg, curl, ca-certificates, and Chromium runtime dependencies
+# Install Python and core dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3-pip \
+    python3.11-venv \
     ffmpeg \
     curl \
     ca-certificates \
-    libnspr4 \
-    libnss3 \
-    libgconf-2-4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libgdk-pixbuf2.0-0 \
-    libgtk-3-0 \
-    libgbm1 \
-    libasound2 \
-    libxss1 \
-    libxkbcommon0 \
-    fonts-liberation \
-    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.11 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
 WORKDIR /app
 
