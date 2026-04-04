@@ -19,6 +19,10 @@ from src.video_downloader import (
 )
 from src import config
 
+# Minimum file size in bytes to consider a download valid (100 KB)
+# Anything smaller is likely an error page, empty file, or ad stub
+MIN_VIDEO_FILE_SIZE = 100 * 1024
+
 # Extensions/patterns that identify a URL as a direct video (skip scraping)
 DIRECT_VIDEO_PATTERNS = (".m3u8", ".mp4", ".webm", ".mkv", ".ts", ".avi", ".flv", ".mov")
 
@@ -91,6 +95,57 @@ AD_URL_PATTERNS = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_downloaded_file(filepath: str) -> dict:
+    """
+    Validate a downloaded file and return result dict.
+    Raises RuntimeError if the file is missing, empty, or too small.
+    """
+    if not os.path.exists(filepath):
+        raise RuntimeError("Download completed but output file not found.")
+
+    file_size = os.path.getsize(filepath)
+    size_mb = file_size / (1024 * 1024)
+
+    if file_size == 0:
+        # Clean up empty file
+        os.remove(filepath)
+        raise RuntimeError(
+            "Downloaded file is empty (0 bytes). The video URL may have expired "
+            "or the server rejected the request. Try sending the original page URL."
+        )
+
+    if file_size < MIN_VIDEO_FILE_SIZE:
+        # Check if it's an HTML error page disguised as a video
+        try:
+            with open(filepath, "rb") as f:
+                header = f.read(512)
+            if b"<html" in header.lower() or b"<!doctype" in header.lower():
+                os.remove(filepath)
+                raise RuntimeError(
+                    "Server returned an HTML page instead of a video. "
+                    "The video URL has likely expired. "
+                    "Try sending the original page URL."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        os.remove(filepath)
+        raise RuntimeError(
+            f"Downloaded file is too small ({file_size} bytes). "
+            "This is likely an error response, not a video. "
+            "Try sending the original page URL."
+        )
+
+    logger.info(f"Validated download: {filepath} ({size_mb:.2f} MB)")
+    return {
+        "filepath": filepath,
+        "filename": os.path.basename(filepath),
+        "size_mb": round(size_mb, 2),
+    }
 
 
 def _get_cdn_referer(domain: str) -> str:
@@ -233,13 +288,16 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
                     bytes_written += len(chunk)
         logger.debug(f"Wrote {bytes_written / 1024 / 1024:.2f} MB to {output_path}")
 
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        if os.path.exists(output_path) and os.path.getsize(output_path) >= MIN_VIDEO_FILE_SIZE:
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             return {
                 "filepath": output_path,
                 "filename": os.path.basename(output_path),
                 "size_mb": round(size_mb, 2),
             }
+        elif os.path.exists(output_path):
+            logger.warning(f"Twitter download too small ({os.path.getsize(output_path)} bytes)")
+            os.remove(output_path)
 
     except Exception as e:
         logger.warning(f"twittervideodownloader.com failed: {e}", exc_info=True)
@@ -474,13 +532,26 @@ def _download_direct_with_headers(
 
         logger.debug(f"Wrote {bytes_written / 1024 / 1024:.2f} MB to {output_path}")
 
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        if os.path.exists(output_path) and os.path.getsize(output_path) >= MIN_VIDEO_FILE_SIZE:
+            # Check that we didn't download an HTML error page
+            with open(output_path, "rb") as f:
+                header = f.read(64)
+            if b"<html" in header.lower() or b"<!doctype" in header.lower():
+                logger.warning("Downloaded file is HTML, not video — removing")
+                os.remove(output_path)
+                return None
+
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             return {
                 "filepath": output_path,
                 "filename": os.path.basename(output_path),
                 "size_mb": round(size_mb, 2),
             }
+        elif os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            logger.warning(f"Downloaded file too small ({file_size} bytes), removing")
+            os.remove(output_path)
+            return None
 
     except req.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
@@ -570,23 +641,15 @@ def download_video(
                 url, output_path, url, session=cdn_session, workers=workers
             )
             if success and os.path.exists(output_path):
-                size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                _update(f"✅ Download complete! ({size_mb:.1f} MB)")
-                return {
-                    "filepath": output_path,
-                    "filename": os.path.basename(output_path),
-                    "size_mb": round(size_mb, 2),
-                }
+                result = _validate_downloaded_file(output_path)
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
             # Check .ts fallback
             ts_path = os.path.splitext(output_path)[0] + ".ts"
             if os.path.exists(ts_path):
-                size_mb = os.path.getsize(ts_path) / (1024 * 1024)
-                _update(f"✅ Download complete! ({size_mb:.1f} MB)")
-                return {
-                    "filepath": ts_path,
-                    "filename": os.path.basename(ts_path),
-                    "size_mb": round(size_mb, 2),
-                }
+                result = _validate_downloaded_file(ts_path)
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
             raise RuntimeError(
                 "HLS download failed. The stream URL may have expired — "
                 "try sending the original page URL instead of the CDN link."
@@ -658,11 +721,8 @@ def download_video(
 
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         _update(f"✅ Download complete! ({size_mb:.1f} MB)")
-        return {
-            "filepath": output_path,
-            "filename": os.path.basename(output_path),
-            "size_mb": round(size_mb, 2),
-        }
+        result = _validate_downloaded_file(output_path)
+        return result
 
     # ── Adult sites: use Playwright scraper (yt-dlp grabs ads) ───────────
     if any(d in domain for d in ADULT_PAGE_DOMAINS):
@@ -866,8 +926,4 @@ def download_video(
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     _update(f"✅ Download complete! ({size_mb:.1f} MB)")
 
-    return {
-        "filepath": output_path,
-        "filename": os.path.basename(output_path),
-        "size_mb": round(size_mb, 2),
-    }
+    return _validate_downloaded_file(output_path)
