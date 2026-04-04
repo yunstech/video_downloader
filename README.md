@@ -4,7 +4,8 @@ A Telegram bot that accepts a URL, extracts and downloads videos (including Clou
 
 ## Features
 
-- 🛡️ **Cloudflare Bypass** — Uses `curl_cffi` with browser TLS impersonation
+- 🌐 **Headless Browser** — Uses Playwright to render JavaScript-heavy pages (Twitter/X, Vimeo, etc.)
+- 🛡️ **Cloudflare Bypass** — Falls back to `curl_cffi` with browser TLS impersonation
 - 🔐 **HLS Decryption** — Supports AES-128 encrypted `.m3u8` streams
 - 📦 **Large File Uploads** — Self-hosted Telegram Bot API supports up to 2 GB
 - ⚡ **Async Queue** — Redis-backed task queue (RQ) for concurrent downloads

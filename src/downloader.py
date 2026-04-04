@@ -101,20 +101,22 @@ def download_video(
     session = None
     network_urls = []
 
-    if method in ("auto", "curl_cffi"):
-        _update("⬇️ Fetching page with curl_cffi...")
-        html, session = fetch_with_curl_cffi(url)
-
-    if html is None and method in ("auto", "playwright"):
-        _update("⬇️ Fetching page with Playwright...")
+    # Try Playwright first (better for embedded videos, captures real network requests)
+    if method in ("auto", "playwright"):
+        _update("🌐 Launching headless browser (Playwright)...")
         result = fetch_with_playwright(url)
         if result:
             html, network_urls = result
 
+    # Fallback to curl_cffi if Playwright fails
+    if html is None and method in ("auto", "curl_cffi"):
+        _update("🌐 Fetching page with curl_cffi (TLS impersonation)...")
+        html, session = fetch_with_curl_cffi(url)
+
     if html is None:
         raise RuntimeError(
-            "Could not fetch the page. Possible Cloudflare block. "
-            "Ensure curl_cffi is installed."
+            "Could not fetch the page. Ensure playwright is installed and "
+            "Chromium browser is available, or try a direct video URL."
         )
 
     # ── Step 2: Extract video URLs ───────────────────────────────────────
