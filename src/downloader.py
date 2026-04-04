@@ -186,6 +186,15 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
         "retries": 3,
     }
 
+    # Use cookies file for Twitter/X if available (needed for auth-gated content)
+    from urllib.parse import urlparse as _urlparse
+    _domain = _urlparse(url).netloc.lower()
+    if any(d in _domain for d in ("x.com", "twitter.com")):
+        cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "twitter_cookies.txt")
+        if os.path.exists(cookies_file):
+            ydl_opts["cookiefile"] = cookies_file
+            logger.info("yt-dlp: using twitter_cookies.txt")
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -295,19 +304,19 @@ def download_video(
     domain = urlparse(url).netloc.lower().replace("www.", "")
 
     if any(d in domain for d in TWITTER_DOMAINS):
-        _update("🐦 Twitter/X URL detected...")
+        _update("🐦 Twitter/X URL detected, trying yt-dlp...")
         unique_prefix = uuid.uuid4().hex[:8]
         output_path = os.path.join(download_dir, f"{unique_prefix}_twitter.mp4")
-        result = _try_twitter_downloader(url, output_path, progress_callback=_update)
-        if result:
-            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
-            return result
-        _update("⚠️ twittervideodownloader.com failed, trying yt-dlp...")
         result = _try_ytdlp(url, output_path, progress_callback=_update)
         if result:
             _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
             return result
-        _update("⚠️ yt-dlp also failed, trying page scraping...")
+        _update("⚠️ yt-dlp failed, trying twittervideodownloader.com...")
+        result = _try_twitter_downloader(url, output_path, progress_callback=_update)
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+        _update("⚠️ All Twitter methods failed, trying page scraping...")
 
     # ── Try yt-dlp for other known platforms (YouTube, Instagram, etc.) ──
     elif any(d in domain for d in YTDLP_PREFERRED_DOMAINS):
