@@ -10,6 +10,7 @@ These functions are executed by rq workers. Each task:
 import os
 import time
 import logging
+import subprocess
 import requests
 
 from src import config
@@ -154,17 +155,52 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
 
         # ── Convert .ts → .mp4 if needed ─────────────────────────────────
         if filepath.lower().endswith(".ts"):
-            _edit_message(chat_id, status_message_id, "🔄 Converting .ts → .mp4...")
-            mp4_path = convert_ts_to_mp4(
-                filepath,
-                progress_callback=progress_callback,
-            )
-            if mp4_path:
-                filepath = mp4_path
-                size_mb = os.path.getsize(filepath) / (1024 * 1024)
-                logger.info(f"Converted to: {filepath} ({size_mb:.1f} MB)")
-            else:
-                logger.warning("Conversion failed, uploading .ts file as-is")
+            mp4_path = os.path.splitext(filepath)[0] + ".mp4"
+
+            # Try 1: Local ffmpeg (fastest, already in Docker image)
+            _edit_message(chat_id, status_message_id, "🔄 Converting .ts → .mp4 (ffmpeg)...")
+            try:
+                cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                    "-i", filepath,
+                    "-c", "copy",
+                    "-bsf:a", "aac_adtstoasc",
+                    "-movflags", "+faststart",
+                    mp4_path,
+                ]
+                result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if result_proc.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
+                    logger.info(f"ffmpeg converted: {filepath} → {mp4_path}")
+                    try:
+                        os.remove(filepath)
+                    except OSError:
+                        pass
+                    filepath = mp4_path
+                    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                else:
+                    logger.warning(f"ffmpeg failed: {result_proc.stderr[:200]}")
+                    raise RuntimeError("ffmpeg conversion failed")
+            except Exception as e:
+                logger.warning(f"ffmpeg conversion failed: {e}")
+                # Clean up failed mp4 if it exists
+                if os.path.exists(mp4_path):
+                    try:
+                        os.remove(mp4_path)
+                    except OSError:
+                        pass
+
+                # Try 2: ConvertHub API
+                _edit_message(chat_id, status_message_id, "🔄 Converting .ts → .mp4 (API)...")
+                api_result = convert_ts_to_mp4(
+                    filepath,
+                    progress_callback=progress_callback,
+                )
+                if api_result:
+                    filepath = api_result
+                    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                    logger.info(f"API converted to: {filepath} ({size_mb:.1f} MB)")
+                else:
+                    logger.warning("All conversion methods failed, uploading .ts as-is")
 
         # ── Check file size ──────────────────────────────────────────────
         if size_mb > config.MAX_FILE_SIZE_MB:

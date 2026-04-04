@@ -105,7 +105,7 @@ def download_video(
     url: str,
     download_dir: str = None,
     method: str = "auto",
-    workers: int = 8,
+    workers: int = 4,
     progress_callback=None,
 ) -> dict:
     """
