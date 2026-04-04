@@ -22,7 +22,7 @@ from src import config
 # Extensions/patterns that identify a URL as a direct video (skip scraping)
 DIRECT_VIDEO_PATTERNS = (".m3u8", ".mp4", ".webm", ".mkv", ".ts", ".avi", ".flv", ".mov")
 
-# Sites that yt-dlp handles better than our scraper
+# Sites that yt-dlp handles well (no ad issues)
 YTDLP_PREFERRED_DOMAINS = (
     "youtube.com", "youtu.be",
     "instagram.com",
@@ -34,222 +34,90 @@ YTDLP_PREFERRED_DOMAINS = (
     "reddit.com",
 )
 
-# Twitter/X domains — handled by yt-dlp first
+# Adult sites — use Playwright scraper instead of yt-dlp
+# yt-dlp downloads ads on these sites
+ADULT_PAGE_DOMAINS = (
+    "pornhub.com",
+    "xvideos.com",
+    "xhamster.com",
+    "redtube.com",
+    "youporn.com",
+    "spankbang.com",
+    "eporner.com",
+    "xnxx.com",
+    "tube8.com",
+    "beeg.com",
+)
+
+# CDN domains for adult sites — direct video URLs that need proper headers
+ADULT_CDN_DOMAINS = (
+    "phncdn.com",       # PornHub CDN
+    "cdn13.com",        # XVideos CDN
+    "xhcdn.com",        # xHamster CDN
+    "rdtcdn.com",       # RedTube CDN
+)
+
+# Twitter/X domains
 TWITTER_DOMAINS = ("x.com", "twitter.com")
 
-# Adult sites — handled by saveporn.net scraper first
-SAVEPORN_DOMAINS = (
-    "pornhub.com", "xvideos.com", "xhamster.com", "redtube.com",
-    "youporn.com", "spankbang.com", "eporner.com", "xnxx.com",
-    "phncdn.com",  # PornHub CDN
-    "tube8.com", "xtube.com", "beeg.com", "thumbzilla.com",
+# Map CDN domains to their parent site referer
+CDN_REFERER_MAP = {
+    "phncdn.com": "https://www.pornhub.com/",
+    "cdn13.com": "https://www.xvideos.com/",
+    "xhcdn.com": "https://www.xhamster.com/",
+    "rdtcdn.com": "https://www.redtube.com/",
+}
+
+# Known ad URL patterns to filter out from scraped results
+AD_URL_PATTERNS = (
+    "trafficjunky.com",
+    "trafficjunky.net",
+    "adskeeper.com",
+    "adspyglass.com",
+    "juicyads.com",
+    "exoclick.com",
+    "exosrv.com",
+    "adxxx.com",
+    "tsyndicate.com",
+    "syndication.com",
+    "popads.net",
+    "plugrush.com",
+    "ad.doubleclick.net",
+    "/ad/",
+    "/ads/",
+    "/adserver/",
+    "tracking.php",
+    "click.php",
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _try_saveporn(url: str, output_path: str, progress_callback=None) -> dict | None:
-    """
-    Download a video via saveporn.net.
-    Submits the URL to their form, extracts the highest-quality mp4 link.
-    """
-    import re
-    import requests as req
+def _get_cdn_referer(domain: str) -> str:
+    """Get the appropriate Referer header for a CDN domain."""
+    for cdn_domain, referer in CDN_REFERER_MAP.items():
+        if cdn_domain in domain:
+            return referer
+    return ""
 
-    def _update(text):
-        logger.info(text)
-        if progress_callback:
-            try:
-                progress_callback(text)
-            except Exception:
-                pass
 
-    _update("🔗 Fetching video link via saveporn.net...")
+def _is_ad_url(url: str) -> bool:
+    """Check if a URL looks like an ad/tracking URL."""
+    url_lower = url.lower()
+    return any(pattern in url_lower for pattern in AD_URL_PATTERNS)
 
-    try:
-        session = req.Session()
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.saveporn.net/",
-            "Origin": "https://www.saveporn.net",
-        }
 
-        # Step 1: GET homepage for session cookies + any tokens
-        logger.debug("GET https://www.saveporn.net/")
-        page_resp = session.get(
-            "https://www.saveporn.net/", headers=headers, timeout=15
-        )
-        page_resp.raise_for_status()
-        logger.debug(f"Homepage status: {page_resp.status_code}")
-
-        # Extract hidden form fields (CSRF or other tokens)
-        tokens = {
-            k: v for k, v in re.findall(
-                r'<input[^>]+name=["\']([^"\']+)["\'][^>]+value=["\']([^"\']*)["\']',
-                page_resp.text
-            )
-        }
-        # Also check reverse order (value before name)
-        tokens.update({
-            k: v for v, k in re.findall(
-                r'<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']([^"\']+)["\']',
-                page_resp.text
-            )
-            if k not in tokens
-        })
-        logger.debug(f"Form tokens found: {list(tokens.keys())}")
-
-        # Find the form action URL
-        form_action = re.search(
-            r'<form[^>]+action=["\']([^"\']+)["\']', page_resp.text
-        )
-        post_url = form_action.group(1) if form_action else "https://www.saveporn.net/"
-        if post_url.startswith("/"):
-            post_url = "https://www.saveporn.net" + post_url
-        elif not post_url.startswith("http"):
-            post_url = "https://www.saveporn.net/" + post_url
-        logger.debug(f"Form action URL: {post_url}")
-
-        # Detect the input field name for the URL
-        url_field = re.search(
-            r'<input[^>]+type=["\'](?:text|url)["\'][^>]+name=["\']([^"\']+)["\']',
-            page_resp.text
-        )
-        if not url_field:
-            # Try reverse attribute order
-            url_field = re.search(
-                r'<input[^>]+name=["\']([^"\']+)["\'][^>]+type=["\'](?:text|url)["\']',
-                page_resp.text
-            )
-        field_name = url_field.group(1) if url_field else "url"
-        logger.debug(f"URL field name: {field_name}")
-
-        # Step 2: POST the video URL
-        post_headers = {
-            **headers,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        # Add CSRF token header if present
-        csrf = (
-            tokens.get("csrfmiddlewaretoken")
-            or tokens.get("_token")
-            or tokens.get("csrf_token")
-            or tokens.get("token")
-        )
-        if csrf:
-            post_headers["X-CSRFToken"] = csrf
-
-        post_data = {field_name: url, **tokens}
-        logger.debug(f"POST {post_url} with field={field_name}")
-
-        resp = session.post(
-            post_url,
-            data=post_data,
-            headers=post_headers,
-            timeout=30,
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-        logger.debug(f"POST status: {resp.status_code}, length: {len(resp.text)}")
-
-        # Step 3: Extract download links — look for mp4 URLs
-        # Pattern 1: Direct mp4 links in href/src attributes
-        mp4_links = re.findall(
-            r'(?:href|src)=["\']([^"\']*\.mp4[^"\']*)["\']',
-            resp.text, re.IGNORECASE
-        )
-        # Pattern 2: Download buttons/links with data attributes
-        mp4_links += re.findall(
-            r'(?:data-url|data-src|data-href|data-download)=["\']([^"\']*\.mp4[^"\']*)["\']',
-            resp.text, re.IGNORECASE
-        )
-        # Pattern 3: Bare URLs in JS or JSON
-        mp4_links += re.findall(
-            r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
-            resp.text, re.IGNORECASE
-        )
-
-        # Deduplicate while preserving order
-        seen = set()
-        links = []
-        for link in mp4_links:
-            link = link.strip()
-            if link and link not in seen:
-                seen.add(link)
-                links.append(link)
-
-        logger.debug(f"Extracted {len(links)} mp4 link(s): {[l[:80] for l in links]}")
-
-        if not links:
-            # Maybe they return m3u8 instead
-            m3u8_links = re.findall(
-                r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)',
-                resp.text, re.IGNORECASE
-            )
-            if m3u8_links:
-                logger.info(f"Found {len(m3u8_links)} m3u8 link(s), using first")
-                chosen = m3u8_links[0].strip()
-                _update("⬇️ Downloading HLS stream via saveporn.net...")
-                mp4_path = os.path.splitext(output_path)[0] + ".mp4"
-                success = download_m3u8_native(
-                    chosen, mp4_path, url, session=session, workers=4
-                )
-                if success and os.path.exists(mp4_path):
-                    size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
-                    return {
-                        "filepath": mp4_path,
-                        "filename": os.path.basename(mp4_path),
-                        "size_mb": round(size_mb, 2),
-                    }
-            logger.warning("saveporn.net: no video links found in response")
-            return None
-
-        # Pick highest quality — sort by resolution if present in URL
-        def _extract_res(u):
-            m = re.search(r'(\d{3,4})[pP]', u)
-            return int(m.group(1)) if m else 0
-
-        links.sort(key=_extract_res)
-        chosen = links[-1]  # highest resolution
-        logger.info(f"Downloading ({len(links)} qualities, best): {chosen[:100]}")
-        _update(f"⬇️ Downloading video ({len(links)} qualities available)...")
-
-        # Step 4: Download the mp4
-        dl_resp = session.get(
-            chosen,
-            headers={
-                "User-Agent": headers["User-Agent"],
-                "Referer": "https://www.saveporn.net/",
-            },
-            stream=True,
-            timeout=120,
-        )
-        dl_resp.raise_for_status()
-
-        bytes_written = 0
-        with open(output_path, "wb") as f:
-            for chunk in dl_resp.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-                    bytes_written += len(chunk)
-        logger.debug(f"Wrote {bytes_written / 1024 / 1024:.2f} MB to {output_path}")
-
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            return {
-                "filepath": output_path,
-                "filename": os.path.basename(output_path),
-                "size_mb": round(size_mb, 2),
-            }
-
-    except Exception as e:
-        logger.warning(f"saveporn.net failed: {e}", exc_info=True)
-
-    return None
+def _filter_ad_urls(video_urls: list) -> list:
+    """Remove ad/tracking URLs from a list of (source, url) tuples."""
+    filtered = []
+    for source, url in video_urls:
+        if _is_ad_url(url):
+            logger.debug(f"Filtered ad URL: {url[:80]}")
+        else:
+            filtered.append((source, url))
+    if len(filtered) < len(video_urls):
+        logger.info(f"Filtered {len(video_urls) - len(filtered)} ad URL(s)")
+    return filtered
 
 
 def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) -> dict | None:
@@ -382,6 +250,7 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
 def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | None:
     """
     Try downloading with yt-dlp. Returns result dict on success, None on failure.
+    Includes ad filtering: skips videos < 30s and videos with ad-like titles.
     """
     try:
         import yt_dlp
@@ -419,6 +288,27 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
         elif status == "error":
             logger.warning(f"yt-dlp hook reported error: {d}")
 
+    def _is_not_ad(info_dict, *, incomplete):
+        """Filter out short videos (likely pre-roll ads) and ad-titled videos."""
+        duration = info_dict.get("duration")
+        if duration is not None and duration < 30:
+            logger.info(f"yt-dlp: skipping short video ({duration}s, likely ad)")
+            return "Skipping short video (likely an ad)"
+        title = (info_dict.get("title") or "").lower()
+        ad_keywords = (
+            "sponsor", "advertisement", "promo", "ad -", "advert",
+            "commercial", "promoted", "- ad", "[ad]", "(ad)",
+        )
+        if any(kw in title for kw in ad_keywords):
+            logger.info(f"yt-dlp: skipping ad-titled video: {title[:60]}")
+            return "Skipping advertisement"
+        # Check the URL itself for ad patterns
+        video_url = info_dict.get("url") or info_dict.get("webpage_url") or ""
+        if _is_ad_url(video_url):
+            logger.info(f"yt-dlp: skipping ad URL: {video_url[:80]}")
+            return "Skipping ad URL"
+        return None
+
     ydl_opts = {
         "outtmpl": output_template,
         "format": "best[ext=mp4]/best",
@@ -430,6 +320,8 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
         "retries": 3,
         "progress_hooks": [_ytdlp_progress_hook],
         "logger": logging.getLogger("yt_dlp"),
+        "match_filter": _is_not_ad,
+        "noplaylist": True,
     }
 
     # Use cookies file for Twitter/X if available (needed for auth-gated content)
@@ -456,8 +348,23 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
                 f"yt-dlp info: extractor={info.get('extractor','?')} "
                 f"title={str(info.get('title','?'))[:60]} "
                 f"ext={info.get('ext','?')} "
-                f"format={info.get('format','?')}"
+                f"format={info.get('format','?')} "
+                f"duration={info.get('duration','?')}"
             )
+
+            # Double-check duration after download (safety net)
+            duration = info.get("duration")
+            if duration is not None and duration < 30:
+                logger.warning(f"yt-dlp: downloaded video is only {duration}s — likely an ad, discarding")
+                # Clean up the ad file
+                filename = ydl.prepare_filename(info)
+                if os.path.exists(filename):
+                    os.remove(filename)
+                    logger.debug(f"Removed ad file: {filename}")
+                mp4_path = os.path.splitext(filename)[0] + ".mp4"
+                if os.path.exists(mp4_path):
+                    os.remove(mp4_path)
+                return None
 
             # Find the downloaded file
             filename = ydl.prepare_filename(info)
@@ -475,6 +382,11 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
 
             if os.path.exists(filename):
                 size_mb = os.path.getsize(filename) / (1024 * 1024)
+                # Another ad heuristic: if file is tiny (< 1 MB), likely an ad
+                if size_mb < 1.0:
+                    logger.warning(f"yt-dlp: downloaded file is only {size_mb:.2f} MB — likely an ad, discarding")
+                    os.remove(filename)
+                    return None
                 logger.info(f"yt-dlp success: {filename} ({size_mb:.2f} MB)")
                 return {
                     "filepath": filename,
@@ -486,6 +398,101 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
     except Exception as e:
         logger.warning(f"yt-dlp failed: {e}", exc_info=True)
         raise
+
+    return None
+
+
+def _download_direct_with_headers(
+    url: str,
+    output_path: str,
+    referer: str = "",
+    progress_callback=None,
+) -> dict | None:
+    """
+    Download a direct video URL with proper browser-like headers.
+    Handles CDN URLs that require Referer/User-Agent to avoid 403.
+    Supports large files with streaming and progress logging.
+    """
+    import requests as req
+
+    def _update(text):
+        logger.info(text)
+        if progress_callback:
+            try:
+                progress_callback(text)
+            except Exception:
+                pass
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",  # avoid gzip for video streams
+        "Connection": "keep-alive",
+    }
+    if referer:
+        headers["Referer"] = referer
+        headers["Origin"] = referer.rstrip("/")
+
+    try:
+        _update("⬇️ Downloading video (direct)...")
+        logger.debug(f"Direct download: {url[:120]}")
+        logger.debug(f"Headers: Referer={referer}")
+
+        resp = req.get(url, headers=headers, stream=True, timeout=120)
+        logger.debug(
+            f"Response: status={resp.status_code}, "
+            f"content-type={resp.headers.get('content-type', '?')}, "
+            f"content-length={resp.headers.get('content-length', '?')}"
+        )
+        resp.raise_for_status()
+
+        # Check content-type — if we got HTML, the token probably expired
+        content_type = resp.headers.get("content-type", "").lower()
+        if "text/html" in content_type:
+            logger.warning("Got HTML response instead of video — token likely expired")
+            return None
+
+        total_bytes = int(resp.headers.get("content-length", 0))
+        bytes_written = 0
+
+        with open(output_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    bytes_written += len(chunk)
+                    if total_bytes and bytes_written % (1024 * 1024 * 5) < 65536:
+                        pct = bytes_written / total_bytes * 100
+                        logger.debug(
+                            f"Progress: {pct:.1f}% "
+                            f"({bytes_written // 1024 // 1024} MB / "
+                            f"{total_bytes // 1024 // 1024} MB)"
+                        )
+
+        logger.debug(f"Wrote {bytes_written / 1024 / 1024:.2f} MB to {output_path}")
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            return {
+                "filepath": output_path,
+                "filename": os.path.basename(output_path),
+                "size_mb": round(size_mb, 2),
+            }
+
+    except req.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        logger.warning(f"Direct download HTTP error {status}: {e}")
+        if status == 403:
+            logger.info("403 Forbidden — CDN token likely expired or bad Referer")
+        elif status == 410:
+            logger.info("410 Gone — CDN token has expired")
+        return None
+    except Exception as e:
+        logger.warning(f"Direct download failed: {e}", exc_info=True)
+        return None
 
     return None
 
@@ -528,22 +535,79 @@ def download_video(
 
     # ── Parse domain early (used by multiple branches) ───────────────────
     from urllib.parse import urlparse
-    domain = urlparse(url).netloc.lower().replace("www.", "")
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower().replace("www.", "")
     logger.debug(f"Parsed domain: {domain}")
 
-    # ── Saveporn.net for adult sites / CDN URLs ──────────────────────────
-    if any(d in domain for d in SAVEPORN_DOMAINS):
-        _update("🔗 Detected supported site, trying saveporn.net...")
-        unique_prefix = uuid.uuid4().hex[:8]
-        output_path = os.path.join(download_dir, f"{unique_prefix}_video.mp4")
-        result = _try_saveporn(url, output_path, progress_callback=_update)
-        if result:
-            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
-            return result
-        _update("⚠️ saveporn.net failed, falling back to other methods...")
-        # Fall through to direct / scraper / yt-dlp logic below
+    # ── Check if this is a CDN direct URL (phncdn.com, etc.) ─────────────
+    is_adult_cdn = any(d in domain for d in ADULT_CDN_DOMAINS)
 
-    # ── Direct video URL fast-path (skip page scraping) ─────────────────
+    if is_adult_cdn:
+        referer = _get_cdn_referer(domain)
+        _update("🎯 CDN video URL detected, downloading with proper headers...")
+        unique_prefix = uuid.uuid4().hex[:8]
+        filename = f"{unique_prefix}_{generate_filename(url)}"
+        output_path = os.path.join(download_dir, filename)
+
+        url_lower = url.lower()
+        if ".m3u8" in url_lower:
+            # HLS stream from CDN
+            if not output_path.lower().endswith((".mp4", ".ts")):
+                output_path = os.path.splitext(output_path)[0] + ".mp4"
+
+            import requests as req
+            cdn_session = req.Session()
+            cdn_session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": referer,
+            })
+            _update("⬇️ Downloading HLS stream...")
+            success = download_m3u8_native(
+                url, output_path, url, session=cdn_session, workers=workers
+            )
+            if success and os.path.exists(output_path):
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                _update(f"✅ Download complete! ({size_mb:.1f} MB)")
+                return {
+                    "filepath": output_path,
+                    "filename": os.path.basename(output_path),
+                    "size_mb": round(size_mb, 2),
+                }
+            # Check .ts fallback
+            ts_path = os.path.splitext(output_path)[0] + ".ts"
+            if os.path.exists(ts_path):
+                size_mb = os.path.getsize(ts_path) / (1024 * 1024)
+                _update(f"✅ Download complete! ({size_mb:.1f} MB)")
+                return {
+                    "filepath": ts_path,
+                    "filename": os.path.basename(ts_path),
+                    "size_mb": round(size_mb, 2),
+                }
+            raise RuntimeError(
+                "HLS download failed. The stream URL may have expired — "
+                "try sending the original page URL instead of the CDN link."
+            )
+        else:
+            # Direct mp4/webm from CDN
+            result = _download_direct_with_headers(
+                url, output_path, referer=referer, progress_callback=_update
+            )
+            if result:
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
+
+            # If direct download failed (403/410), token is probably expired
+            raise RuntimeError(
+                "CDN download failed (token likely expired). "
+                "Try sending the original page URL instead of the CDN link, "
+                "e.g. https://www.pornhub.com/view_video.php?viewkey=..."
+            )
+
+    # ── Direct video URL fast-path (non-CDN) ─────────────────────────────
     url_lower = url.lower().split("?")[0]
     is_direct = any(url_lower.endswith(ext) for ext in DIRECT_VIDEO_PATTERNS)
     logger.debug(f"is_direct={is_direct}, url_lower={url_lower}")
@@ -554,17 +618,23 @@ def download_video(
         filename = f"{unique_prefix}_{generate_filename(url)}"
         output_path = os.path.join(download_dir, filename)
 
-        # Create a session with proper headers for CDN URLs
-        import requests
-        cdn_session = requests.Session()
-        cdn_session.headers.update({
+        # Use proper headers even for generic direct URLs
+        result = _download_direct_with_headers(
+            url, output_path, referer=url, progress_callback=_update
+        )
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+
+        # Fallback: try the original download_direct with a session
+        import requests as req
+        fallback_session = req.Session()
+        fallback_session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
-            "Referer": url,
-            "Accept": "*/*",
         })
 
         if ".m3u8" in url.lower():
@@ -572,11 +642,11 @@ def download_video(
                 output_path = os.path.splitext(output_path)[0] + ".mp4"
             _update("⬇️ Downloading HLS stream...")
             success = download_m3u8_native(
-                url, output_path, url, session=cdn_session, workers=workers
+                url, output_path, url, session=fallback_session, workers=workers
             )
         else:
             _update("⬇️ Downloading video...")
-            download_direct(url, output_path, url, session=cdn_session)
+            download_direct(url, output_path, url, session=fallback_session)
             success = True
 
         if not success or not os.path.exists(output_path):
@@ -594,8 +664,14 @@ def download_video(
             "size_mb": round(size_mb, 2),
         }
 
+    # ── Adult sites: use Playwright scraper (yt-dlp grabs ads) ───────────
+    if any(d in domain for d in ADULT_PAGE_DOMAINS):
+        _update("🎬 Fetching video via browser...")
+        logger.info(f"Adult site detected ({domain}), using Playwright scraper (yt-dlp downloads ads)")
+        # Fall through directly to Step 1 (page scraping) below
+
     # ── Twitter/X: use yt-dlp ────────────────────────────────────────────
-    if any(d in domain for d in TWITTER_DOMAINS):
+    elif any(d in domain for d in TWITTER_DOMAINS):
         _update("🐦 Twitter/X URL detected, trying yt-dlp...")
         unique_prefix = uuid.uuid4().hex[:8]
         output_path = os.path.join(download_dir, f"{unique_prefix}_twitter.mp4")
@@ -628,7 +704,7 @@ def download_video(
             return result
         _update("⚠️ yt-dlp failed, falling back to page scraping...")
     else:
-        logger.debug(f"Domain '{domain}' not in Twitter or preferred yt-dlp list, using scraper")
+        logger.debug(f"Domain '{domain}' not in any preferred list, using scraper")
 
     # ── Step 1: Fetch the page ───────────────────────────────────────────
     html = None
@@ -671,6 +747,9 @@ def download_video(
             video_urls.insert(0, ("network-capture", nurl))
     logger.debug(f"After network-capture merge: {len(video_urls)} URL(s) total")
 
+    # Filter out ad/tracking URLs
+    video_urls = _filter_ad_urls(video_urls)
+
     downloadable = [(s, u) for s, u in video_urls if s != "iframe"]
     logger.debug(f"Downloadable (non-iframe): {len(downloadable)} — {[(s, u[:80]) for s, u in downloadable]}")
 
@@ -679,6 +758,10 @@ def download_video(
         iframes = [(s, u) for s, u in video_urls if s == "iframe"]
         logger.debug(f"No direct URLs; checking {len(iframes)} iframe(s)")
         for _, iframe_url in iframes:
+            # Skip ad iframes
+            if _is_ad_url(iframe_url):
+                logger.debug(f"Skipping ad iframe: {iframe_url[:80]}")
+                continue
             logger.info(f"Checking iframe: {iframe_url[:80]}...")
             try:
                 if session:
@@ -686,6 +769,7 @@ def download_video(
                     logger.debug(f"Iframe fetch status: {resp.status_code}")
                     if resp.status_code == 200:
                         extra = extract_video_urls(resp.text, iframe_url)
+                        extra = _filter_ad_urls(extra)
                         logger.debug(f"Iframe yielded {len(extra)} extra URL(s)")
                         downloadable.extend(
                             [(s, u) for s, u in extra if s != "iframe"]
@@ -694,7 +778,7 @@ def download_video(
                 logger.warning(f"Iframe fetch failed: {e}")
 
     if not downloadable:
-        # Last resort: try yt-dlp on the original URL
+        # Last resort: try yt-dlp on the original URL (with ad filtering)
         _update("⚠️ No video URLs found via scraping, trying yt-dlp...")
         unique_prefix = uuid.uuid4().hex[:8]
         output_path = os.path.join(download_dir, f"{unique_prefix}_video.mp4")
@@ -708,6 +792,7 @@ def download_video(
         )
 
     # ── Step 3: Pick best URL ────────────────────────────────────────────
+    # Prefer network-captured URLs (real playback URLs, not ads)
     network_items = [(s, u) for s, u in downloadable if s == "network-capture"]
     other_items = [(s, u) for s, u in downloadable if s != "network-capture"]
     downloadable = network_items + other_items
@@ -723,13 +808,44 @@ def download_video(
     # ── Step 5: Download ─────────────────────────────────────────────────
     _update(f"⬇️ Downloading video...")
 
+    # Determine the right referer for the download
+    download_referer = url  # use the page URL as referer
+    cdn_referer = _get_cdn_referer(
+        urlparse(chosen_url).netloc.lower()
+    )
+    if cdn_referer:
+        download_referer = cdn_referer
+
     if ".m3u8" in chosen_url.lower():
         if not output_path.lower().endswith((".mp4", ".ts")):
             output_path = os.path.splitext(output_path)[0] + ".mp4"
+
+        # Use session with proper headers for HLS
+        if session is None:
+            import requests as req
+            session = req.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": download_referer,
+        })
         success = download_m3u8_native(
             chosen_url, output_path, url, session, workers=workers
         )
     else:
+        # Try our improved direct downloader first
+        result = _download_direct_with_headers(
+            chosen_url, output_path, referer=download_referer,
+            progress_callback=_update
+        )
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+
+        # Fallback to original download_direct
         download_direct(chosen_url, output_path, url, session)
         success = True
 
@@ -738,7 +854,7 @@ def download_video(
         if os.path.exists(ts_path):
             output_path = ts_path
         else:
-            # Last resort: try yt-dlp
+            # Last resort: try yt-dlp (with ad filtering)
             _update("⚠️ Scraper download failed, trying yt-dlp as last resort...")
             ytdlp_path = os.path.join(download_dir, f"{uuid.uuid4().hex[:8]}_video.mp4")
             result = _try_ytdlp(url, ytdlp_path, progress_callback=_update)
