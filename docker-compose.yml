@@ -57,6 +57,10 @@ services:
         condition: service_healthy
     volumes:
       - downloads:/app/downloads
+      # Optional: mount Twitter cookies for yt-dlp (Netscape format from x.com)
+      # Create an empty file first if you don't have cookies yet:
+      #   touch twitter_cookies.txt
+      - ./twitter_cookies.txt:/app/twitter_cookies.txt:ro
     shm_size: 256m
     mem_limit: 2g
     # Scale workers: docker compose up --scale worker=2 (max for 2-core/8GB)
