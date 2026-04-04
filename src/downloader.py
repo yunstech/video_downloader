@@ -568,6 +568,108 @@ def _download_direct_with_headers(
     return None
 
 
+def _download_m3u8_ffmpeg(
+    m3u8_url: str,
+    output_path: str,
+    referer: str = "",
+    progress_callback=None,
+) -> bool:
+    """
+    Download an HLS stream using ffmpeg.
+    Much more reliable than custom segment downloading — ffmpeg handles:
+    - Variant/master playlists (auto-selects best quality)
+    - Segment retries and reassembly
+    - Proper muxing to mp4
+    Returns True on success, False on failure.
+    """
+    import subprocess
+    import shutil
+
+    def _update(text):
+        logger.info(text)
+        if progress_callback:
+            try:
+                progress_callback(text)
+            except Exception:
+                pass
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        logger.warning("ffmpeg not found in PATH, cannot use ffmpeg for HLS")
+        return False
+
+    # Ensure output is .mp4
+    if not output_path.lower().endswith(".mp4"):
+        output_path = os.path.splitext(output_path)[0] + ".mp4"
+
+    _update("⬇️ Downloading HLS stream with ffmpeg...")
+
+    # Build ffmpeg command
+    cmd = [
+        ffmpeg_path,
+        "-y",  # overwrite output
+    ]
+
+    # Add headers
+    headers_str = (
+        f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/120.0.0.0 Safari/537.36\r\n"
+    )
+    if referer:
+        headers_str += f"Referer: {referer}\r\n"
+
+    cmd.extend([
+        "-headers", headers_str,
+        "-i", m3u8_url,
+        "-c", "copy",           # no re-encoding, just copy streams
+        "-bsf:a", "aac_adtstoasc",  # fix AAC stream for mp4 container
+        "-movflags", "+faststart",   # enable streaming-friendly mp4
+        "-loglevel", "warning",
+        output_path,
+    ])
+
+    logger.debug(f"ffmpeg cmd: {' '.join(cmd[:6])}... {output_path}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout
+        )
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            logger.warning(f"ffmpeg failed (rc={result.returncode}): {stderr[:200]}")
+            # Clean up partial file
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return False
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) >= MIN_VIDEO_FILE_SIZE:
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"ffmpeg HLS download success: {output_path} ({size_mb:.2f} MB)")
+            return True
+        else:
+            file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            logger.warning(f"ffmpeg output too small or missing ({file_size} bytes)")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg timed out after 300s")
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        return False
+    except Exception as e:
+        logger.warning(f"ffmpeg failed: {e}", exc_info=True)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        return False
+
+
 def _extract_pornhub_video_urls(html: str) -> list:
     """
     Extract video URLs from PornHub's JavaScript flashvars/mediaDefinitions.
@@ -701,20 +803,26 @@ def download_video(
             if not output_path.lower().endswith((".mp4", ".ts")):
                 output_path = os.path.splitext(output_path)[0] + ".mp4"
 
-            import requests as req
-            cdn_session = req.Session()
-            cdn_session.headers.update({
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Referer": referer,
-            })
             _update("⬇️ Downloading HLS stream...")
-            success = download_m3u8_native(
-                url, output_path, url, session=cdn_session, workers=workers
+            # Try ffmpeg first (most reliable for HLS)
+            success = _download_m3u8_ffmpeg(
+                url, output_path, referer=referer, progress_callback=_update
             )
+            # Fallback to native downloader
+            if not success:
+                import requests as req
+                cdn_session = req.Session()
+                cdn_session.headers.update({
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": referer,
+                })
+                success = download_m3u8_native(
+                    url, output_path, url, session=cdn_session, workers=workers
+                )
             if success and os.path.exists(output_path):
                 result = _validate_downloaded_file(output_path)
                 _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
@@ -779,9 +887,15 @@ def download_video(
             if not output_path.lower().endswith((".mp4", ".ts")):
                 output_path = os.path.splitext(output_path)[0] + ".mp4"
             _update("⬇️ Downloading HLS stream...")
-            success = download_m3u8_native(
-                url, output_path, url, session=fallback_session, workers=workers
+            # Try ffmpeg first
+            success = _download_m3u8_ffmpeg(
+                url, output_path, referer=url, progress_callback=_update
             )
+            # Fallback to native
+            if not success:
+                success = download_m3u8_native(
+                    url, output_path, url, session=fallback_session, workers=workers
+                )
         else:
             _update("⬇️ Downloading video...")
             download_direct(url, output_path, url, session=fallback_session)
@@ -1011,21 +1125,29 @@ def download_video(
         if not output_path.lower().endswith((".mp4", ".ts")):
             output_path = os.path.splitext(output_path)[0] + ".mp4"
 
-        # Use session with proper headers for HLS
-        if session is None:
-            import requests as req
-            session = req.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": download_referer,
-        })
-        success = download_m3u8_native(
-            chosen_url, output_path, url, session, workers=workers
+        # Try ffmpeg first (most reliable for HLS — downloads ALL segments)
+        success = _download_m3u8_ffmpeg(
+            chosen_url, output_path, referer=download_referer,
+            progress_callback=_update
         )
+
+        # Fallback to native downloader if ffmpeg unavailable or failed
+        if not success:
+            logger.info("ffmpeg HLS failed, trying native m3u8 downloader")
+            if session is None:
+                import requests as req
+                session = req.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": download_referer,
+            })
+            success = download_m3u8_native(
+                chosen_url, output_path, url, session, workers=workers
+            )
     else:
         # Try our improved direct downloader first
         result = _download_direct_with_headers(
