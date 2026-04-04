@@ -22,7 +22,83 @@ from src import config
 # Extensions/patterns that identify a URL as a direct video (skip scraping)
 DIRECT_VIDEO_PATTERNS = (".m3u8", ".mp4", ".webm", ".mkv", ".ts", ".avi", ".flv", ".mov")
 
+# Sites that yt-dlp handles better than our scraper
+YTDLP_PREFERRED_DOMAINS = (
+    "x.com", "twitter.com",
+    "youtube.com", "youtu.be",
+    "instagram.com",
+    "facebook.com", "fb.watch",
+    "tiktok.com",
+    "vimeo.com",
+    "dailymotion.com",
+    "twitch.tv",
+    "reddit.com",
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | None:
+    """
+    Try downloading with yt-dlp. Returns result dict on success, None on failure.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        logger.warning("yt-dlp not installed, skipping yt-dlp fallback")
+        return None
+
+    logger.info(f"Trying yt-dlp for: {url[:80]}...")
+    if progress_callback:
+        try:
+            progress_callback("⬇️ Downloading with yt-dlp...")
+        except Exception:
+            pass
+
+    # Remove extension — yt-dlp adds its own
+    output_template = os.path.splitext(output_path)[0] + ".%(ext)s"
+
+    ydl_opts = {
+        "outtmpl": output_template,
+        "format": "best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 3,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                return None
+
+            # Find the downloaded file
+            filename = ydl.prepare_filename(info)
+            # yt-dlp may change extension
+            if not os.path.exists(filename):
+                # Try .mp4
+                filename = os.path.splitext(filename)[0] + ".mp4"
+            if not os.path.exists(filename):
+                # Search for any file matching the pattern
+                base = os.path.splitext(output_template.replace("%(ext)s", ""))[0]
+                import glob
+                matches = glob.glob(base + ".*")
+                if matches:
+                    filename = matches[0]
+
+            if os.path.exists(filename):
+                size_mb = os.path.getsize(filename) / (1024 * 1024)
+                return {
+                    "filepath": filename,
+                    "filename": os.path.basename(filename),
+                    "size_mb": round(size_mb, 2),
+                }
+    except Exception as e:
+        logger.warning(f"yt-dlp failed: {e}")
+
+    return None
 
 
 def download_video(
@@ -95,6 +171,19 @@ def download_video(
             "filename": os.path.basename(output_path),
             "size_mb": round(size_mb, 2),
         }
+
+    # ── Try yt-dlp for known platforms (Twitter/X, YouTube, etc.) ────────
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.lower().replace("www.", "")
+    if any(d in domain for d in YTDLP_PREFERRED_DOMAINS):
+        _update(f"🎬 Detected supported platform, trying yt-dlp...")
+        unique_prefix = uuid.uuid4().hex[:8]
+        output_path = os.path.join(download_dir, f"{unique_prefix}_video.mp4")
+        result = _try_ytdlp(url, output_path, progress_callback=_update)
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+        _update("⚠️ yt-dlp failed, falling back to page scraping...")
 
     # ── Step 1: Fetch the page ───────────────────────────────────────────
     html = None

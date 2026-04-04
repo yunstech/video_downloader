@@ -183,16 +183,39 @@ def fetch_with_playwright(url):
             ct = response.headers.get("content-type", "")
             status = response.status
 
+            # Skip API/GraphQL endpoints — these are data, not video files
+            skip_patterns = (
+                "/graphql/", "/api/", "/1.1/", "/2/",
+                "api.x.com", "api.twitter.com",
+            )
+            if any(pat in u for pat in skip_patterns):
+                return
+
             # Capture actual video content responses (the real CDN URLs)
-            if "video" in ct or "octet-stream" in ct:
-                # For redirected responses, the final URL is what we want
+            if "video" in ct:
                 video_network_urls.append(u)
                 print(f"    📡 Captured (content-type: {ct}): {u[:80]}...")
+
+            # Only capture octet-stream if URL looks like a video
+            elif "octet-stream" in ct and _looks_like_video(u):
+                video_network_urls.append(u)
+                print(f"    📡 Captured (octet-stream + video URL): {u[:80]}...")
 
             # Also capture by URL extension
             elif any(ext in u.lower().split("?")[0] for ext in VIDEO_EXTENSIONS):
                 video_network_urls.append(u)
                 print(f"    📡 Captured (extension match): {u[:80]}...")
+
+            # Capture known video CDN domains
+            video_cdns = (
+                "video.twimg.com", "pbs.twimg.com",
+                "cdn.video.", ".googlevideo.com",
+                "vod-adaptive", ".akamaized.net",
+            )
+            if any(cdn in u for cdn in video_cdns):
+                if u not in video_network_urls:
+                    video_network_urls.append(u)
+                    print(f"    📡 Captured (CDN match): {u[:80]}...")
 
             # Capture redirects (301/302/307/308) pointing to video
             if status in (301, 302, 307, 308):
@@ -244,6 +267,10 @@ def fetch_with_playwright(url):
                         document.querySelectorAll('video').forEach(v => {
                             if (v.currentSrc) urls.push(v.currentSrc);
                             if (v.src) urls.push(v.src);
+                            // Check source elements inside video
+                            v.querySelectorAll('source').forEach(s => {
+                                if (s.src) urls.push(s.src);
+                            });
                         });
                         // Check for common player APIs
                         if (window.player && window.player.src) urls.push(
@@ -252,7 +279,37 @@ def fetch_with_playwright(url):
                         );
                         if (window.videoUrl) urls.push(window.videoUrl);
                         if (window.video_url) urls.push(window.video_url);
-                        return urls;
+
+                        // Twitter/X: extract from React internal state
+                        try {
+                            const selectors = [
+                                '[data-testid="videoPlayer"] video',
+                                'video[src*="video.twimg"]',
+                                'video[poster*="pbs.twimg"]',
+                            ];
+                            for (const sel of selectors) {
+                                document.querySelectorAll(sel).forEach(v => {
+                                    if (v.src) urls.push(v.src);
+                                    if (v.currentSrc) urls.push(v.currentSrc);
+                                });
+                            }
+                        } catch(e) {}
+
+                        // Search for video URLs in all script tags
+                        try {
+                            const scripts = document.querySelectorAll('script');
+                            const videoRegex = /https?:\\/\\/video\\.twimg\\.com\\/[^"'\\s]+\\.mp4[^"'\\s]*/g;
+                            const m3u8Regex = /https?:\\/\\/video\\.twimg\\.com\\/[^"'\\s]+\\.m3u8[^"'\\s]*/g;
+                            scripts.forEach(s => {
+                                if (s.textContent) {
+                                    const mp4Matches = s.textContent.match(videoRegex) || [];
+                                    const m3u8Matches = s.textContent.match(m3u8Regex) || [];
+                                    urls.push(...mp4Matches, ...m3u8Matches);
+                                }
+                            });
+                        } catch(e) {}
+
+                        return [...new Set(urls)];
                     }
                 """)
                 for js_url in js_urls:
@@ -300,6 +357,8 @@ def extract_video_urls(html, base_url):
         r'''video\.src\s*=\s*["'](https?://[^"']+)["']''',
         r'''(?:loadVideo|playVideo|initPlayer|setSource)\s*\(\s*["'](https?://[^"']+)["']''',
         r'''(https?:\\?/\\?/[^"'\s\\]+\.(?:mp4|m3u8)[^"'\s\\]*)''',
+        # Twitter/X video CDN
+        r'''(https?://video\.twimg\.com/[^"'\s]+)''',
     ]
     for pattern in js_patterns:
         for match in re.finditer(pattern, html, re.IGNORECASE):

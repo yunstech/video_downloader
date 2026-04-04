@@ -7,3 +7,4 @@ tqdm
 pycryptodome
 requests
 playwright>=1.40
+yt-dlp>=2024.1
