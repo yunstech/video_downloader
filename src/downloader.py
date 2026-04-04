@@ -236,9 +236,17 @@ def download_video(
                 logger.warning(f"Iframe fetch failed: {e}")
 
     if not downloadable:
+        # Last resort: try yt-dlp on the original URL
+        _update("⚠️ No video URLs found via scraping, trying yt-dlp...")
+        unique_prefix = uuid.uuid4().hex[:8]
+        output_path = os.path.join(download_dir, f"{unique_prefix}_video.mp4")
+        result = _try_ytdlp(url, output_path, progress_callback=_update)
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
         raise RuntimeError(
             "No downloadable video URLs found on the page. "
-            "Try using --method playwright or provide a direct URL."
+            "Try sending a direct video URL."
         )
 
     # ── Step 3: Pick best URL ────────────────────────────────────────────
@@ -274,6 +282,13 @@ def download_video(
         if os.path.exists(ts_path):
             output_path = ts_path
         else:
+            # Last resort: try yt-dlp
+            _update("⚠️ Scraper download failed, trying yt-dlp as last resort...")
+            ytdlp_path = os.path.join(download_dir, f"{uuid.uuid4().hex[:8]}_video.mp4")
+            result = _try_ytdlp(url, ytdlp_path, progress_callback=_update)
+            if result:
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
             raise RuntimeError("Download completed but output file not found.")
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)

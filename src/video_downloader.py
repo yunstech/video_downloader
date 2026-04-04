@@ -236,7 +236,19 @@ def fetch_with_playwright(url):
         page.on("response", on_response)
         page.on("request", on_request)
         try:
-            page.goto(url, wait_until="networkidle", timeout=45000)
+            # Use domcontentloaded instead of networkidle — many sites never stop loading
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                # Wait a bit for JS to execute and video elements to appear
+                time.sleep(3)
+                # Then try to wait for network to settle (but don't fail if it doesn't)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass  # networkidle timeout is not fatal
+            except Exception as e:
+                print(f"  ⚠️  Navigation warning: {e}")
+                # Page may have partially loaded — still try to extract
             time.sleep(2)
 
             # Try multiple selectors to trigger video playback
