@@ -305,6 +305,101 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
     return None
 
 
+# ── Vidara.to / Vidara.so handler ────────────────────────────────────────────
+
+VIDARA_DOMAINS = ("vidara.to", "vidara.so")
+
+
+def _try_vidara(url: str, output_path: str, progress_callback=None) -> dict | None:
+    """
+    Download a video from Vidara.to/Vidara.so by calling their stream API.
+
+    Flow:
+    1. Extract filecode from URL (vidara.to/v/<code> or vidara.so/e/<code>)
+    2. POST to Vidara.so/api/stream with filecode → get master m3u8 URL
+    3. Download the full HLS stream via download_m3u8_native()
+    """
+    import re
+    from curl_cffi import requests as cffi_req
+
+    def _update(text):
+        logger.info(text)
+        if progress_callback:
+            try:
+                progress_callback(text)
+            except Exception:
+                pass
+
+    # Extract filecode from URL
+    # Patterns: vidara.to/v/<code>  or  vidara.so/e/<code>  or  vidara.to/<code>
+    match = re.search(r'vidara\.(?:to|so)/(?:v|e|d)/([A-Za-z0-9]+)', url)
+    if not match:
+        match = re.search(r'vidara\.(?:to|so)/([A-Za-z0-9]{8,})', url)
+    if not match:
+        logger.warning(f"Vidara: could not extract filecode from URL: {url}")
+        return None
+
+    filecode = match.group(1)
+    logger.info(f"Vidara filecode: {filecode}")
+    _update("🎬 Vidara detected — fetching stream info...")
+
+    try:
+        session = cffi_req.Session(impersonate="chrome")
+        headers = {
+            "Referer": "https://Vidara.so/",
+            "Content-Type": "application/json",
+        }
+
+        # Call the stream API
+        resp = session.post(
+            "https://Vidara.so/api/stream",
+            headers=headers,
+            json={"filecode": filecode, "device": "web"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        streaming_url = data.get("streaming_url")
+        title = data.get("title", filecode)
+        logger.debug(f"Vidara API response: title={title}, streaming_url={streaming_url!r}")
+
+        if not streaming_url:
+            logger.warning("Vidara: API returned no streaming_url")
+            return None
+
+        _update(f"⬇️ Downloading: {title}")
+
+        # Ensure output path ends in .mp4
+        if not output_path.lower().endswith((".mp4", ".ts")):
+            output_path = os.path.splitext(output_path)[0] + ".mp4"
+
+        # Download the full HLS stream using our native downloader
+        success = download_m3u8_native(
+            streaming_url,
+            output_path,
+            referer="https://Vidara.so/",
+            session=None,
+            workers=4,
+        )
+
+        if not success or not os.path.exists(output_path):
+            # Check for .ts fallback
+            ts_path = os.path.splitext(output_path)[0] + ".ts"
+            if os.path.exists(ts_path):
+                output_path = ts_path
+            else:
+                logger.warning("Vidara: HLS download failed")
+                return None
+
+        return _validate_downloaded_file(output_path)
+
+    except Exception as e:
+        logger.warning(f"Vidara download failed: {e}", exc_info=True)
+
+    return None
+
+
 def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | None:
     """
     Try downloading with yt-dlp. Returns result dict on success, None on failure.
@@ -939,6 +1034,17 @@ def download_video(
             logger.warning(f"yt-dlp failed for adult site: {e}")
         _update("⚠️ yt-dlp failed, falling back to page scraping...")
         # Fall through to Step 1 (page scraping) below
+
+    # ── Vidara.to / Vidara.so: call their stream API directly ────────────
+    elif any(d in domain for d in VIDARA_DOMAINS):
+        _update("🎬 Vidara detected, fetching stream...")
+        unique_prefix = uuid.uuid4().hex[:8]
+        output_path = os.path.join(download_dir, f"{unique_prefix}_vidara.mp4")
+        result = _try_vidara(url, output_path, progress_callback=_update)
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+        _update("⚠️ Vidara API failed, falling back to page scraping...")
 
     # ── Twitter/X: use yt-dlp ────────────────────────────────────────────
     elif any(d in domain for d in TWITTER_DOMAINS):
