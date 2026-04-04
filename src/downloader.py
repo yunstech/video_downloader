@@ -1226,10 +1226,33 @@ def download_video(
         )
 
     # ── Step 3: Pick best URL ────────────────────────────────────────────
-    # Prefer network-captured URLs (real playback URLs, not ads)
-    network_items = [(s, u) for s, u in downloadable if s == "network-capture"]
-    other_items = [(s, u) for s, u in downloadable if s != "network-capture"]
-    downloadable = network_items + other_items
+    # Priority order:
+    # 1. m3u8 playlists (full HLS stream — always preferred over segments)
+    # 2. mp4 direct URLs
+    # 3. Network-captured URLs (real playback URLs, not ads)
+    # 4. Other (js-pattern, html-tag, etc.)
+    #
+    # We specifically deprioritize individual .ts segment URLs because those
+    # are only a single HLS segment (a few seconds), not the full video.
+    def _url_priority(item):
+        source, u = item
+        u_lower = u.lower()
+        # m3u8 playlists — best (gives us ALL segments)
+        if ".m3u8" in u_lower:
+            return 0
+        # Individual .ts segments — worst (only a few seconds)
+        if u_lower.split("?")[0].endswith(".ts"):
+            return 4
+        # Direct mp4 — great
+        if ".mp4" in u_lower:
+            return 1
+        # Network-captured (non-ts, non-m3u8)
+        if source == "network-capture":
+            return 2
+        # Everything else
+        return 3
+
+    downloadable.sort(key=_url_priority)
 
     _, chosen_url = downloadable[0]
     logger.info(f"Selected URL: {chosen_url[:100]}...")
