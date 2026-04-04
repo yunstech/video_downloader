@@ -251,8 +251,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ Queued for download (position #{queue.count})\n"
             f"🔗 {url[:80]}{'...' if len(url) > 80 else ''}\n"
-            f"🆔 Job: `{job.id[:8]}`"
-        , parse_mode="Markdown")
+            f"🆔 Job: {job.id[:8]}"
+        )
 
     except Exception as e:
         logger.exception(f"Failed to enqueue job for {url}")

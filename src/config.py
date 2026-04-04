@@ -58,7 +58,7 @@ logging.getLogger("yt_dlp").setLevel(logging.DEBUG)
 
 # ── Rate Limiting ────────────────────────────────────────────────────────────
 
-MAX_JOBS_PER_USER = int(os.getenv("MAX_JOBS_PER_USER", "3"))
+MAX_JOBS_PER_USER = int(os.getenv("MAX_JOBS_PER_USER", "50"))
 
 # ── ConvertHub API (ts → mp4 conversion) ────────────────────────────────────
 
