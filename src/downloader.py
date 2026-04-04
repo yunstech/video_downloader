@@ -232,7 +232,11 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             logger.debug(f"yt-dlp extract_info start: {url}")
-            info = ydl.extract_info(url, download=True)
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception as inner_e:
+                # Re-raise so the caller gets the exact yt-dlp error message
+                raise inner_e
             if info is None:
                 logger.warning("yt-dlp: extract_info returned None")
                 return None
@@ -272,6 +276,7 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
                 logger.warning(f"yt-dlp: expected output file not found: {filename}")
     except Exception as e:
         logger.warning(f"yt-dlp failed: {e}", exc_info=True)
+        raise  # re-raise so callers can inspect the error
 
     return None
 
@@ -359,17 +364,23 @@ def download_video(
         _update("🐦 Twitter/X URL detected, trying yt-dlp...")
         unique_prefix = uuid.uuid4().hex[:8]
         output_path = os.path.join(download_dir, f"{unique_prefix}_twitter.mp4")
-        result = _try_ytdlp(url, output_path, progress_callback=_update)
-        if result:
-            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
-            return result
-        # yt-dlp failed (usually needs login) — raise a helpful error immediately.
-        # Playwright/scraper cannot handle Twitter's JS-heavy auth wall either.
-        raise RuntimeError(
-            "Twitter/X video download failed.\n\n"
-            "Twitter requires login to access most videos.\n"
-            "👉 Place a twitter_cookies.txt (Netscape format) in the bot's data directory to enable downloads."
-        )
+        try:
+            result = _try_ytdlp(url, output_path, progress_callback=_update)
+            if result:
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
+            raise RuntimeError("yt-dlp returned no result")
+        except Exception as e:
+            err_str = str(e).lower()
+            if "no video" in err_str or "no formats" in err_str:
+                raise RuntimeError("This tweet does not contain a video.")
+            elif "login" in err_str or "auth" in err_str or "age" in err_str or "private" in err_str:
+                raise RuntimeError(
+                    "Twitter/X requires login to download this video. "
+                    "Add a twitter_cookies.txt file to the bot's data directory."
+                )
+            else:
+                raise RuntimeError(f"Twitter/X download failed: {str(e).splitlines()[0]}")
 
     # ── Try yt-dlp for other known platforms (YouTube, Instagram, etc.) ──
     elif any(d in domain for d in YTDLP_PREFERRED_DOMAINS):

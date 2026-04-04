@@ -24,17 +24,19 @@ logger = logging.getLogger(__name__)
 API_BASE = f"{config.TELEGRAM_BOT_API_URL}/bot{config.TELEGRAM_BOT_TOKEN}"
 
 
-def _edit_message(chat_id: int, message_id: int, text: str):
+def _edit_message(chat_id: int, message_id: int, text: str, use_markdown: bool = False):
     """Edit a Telegram message with the given text."""
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    if use_markdown:
+        payload["parse_mode"] = "Markdown"
     try:
         resp = requests.post(
             f"{API_BASE}/editMessageText",
-            json={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "parse_mode": "Markdown",
-            },
+            json=payload,
             timeout=10,
         )
         if not resp.ok:
