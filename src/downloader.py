@@ -24,7 +24,6 @@ DIRECT_VIDEO_PATTERNS = (".m3u8", ".mp4", ".webm", ".mkv", ".ts", ".avi", ".flv"
 
 # Sites that yt-dlp handles better than our scraper
 YTDLP_PREFERRED_DOMAINS = (
-    "x.com", "twitter.com",
     "youtube.com", "youtu.be",
     "instagram.com",
     "facebook.com", "fb.watch",
@@ -35,7 +34,128 @@ YTDLP_PREFERRED_DOMAINS = (
     "reddit.com",
 )
 
+# Twitter/X domains — handled by twittervideodownloader.com scraper first
+TWITTER_DOMAINS = ("x.com", "twitter.com")
+
 logger = logging.getLogger(__name__)
+
+
+def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) -> dict | None:
+    """
+    Download a Twitter/X video via twittervideodownloader.com.
+    Scrapes the download page to get the real CDN video URL, then downloads it.
+    """
+    import re
+    import requests as req
+
+    def _update(text):
+        logger.info(text)
+        if progress_callback:
+            try:
+                progress_callback(text)
+            except Exception:
+                pass
+
+    _update("🐦 Fetching video link via twittervideodownloader.com...")
+
+    try:
+        # Step 1: POST the Twitter URL to the downloader service
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://twittervideodownloader.com/",
+            "Origin": "https://twittervideodownloader.com",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        # Get the page first to extract any CSRF token
+        session = req.Session()
+        page_resp = session.get("https://twittervideodownloader.com/", headers=headers, timeout=15)
+
+        # Extract CSRF / nonce token if present
+        csrf_token = ""
+        csrf_match = re.search(
+            r'<input[^>]+name=["\']_?(?:token|csrf|nonce)["\'][^>]+value=["\']([^"\']+)["\']',
+            page_resp.text, re.IGNORECASE
+        )
+        if csrf_match:
+            csrf_token = csrf_match.group(1)
+
+        post_data = {"tweet": url}
+        if csrf_token:
+            post_data["token"] = csrf_token
+
+        resp = session.post(
+            "https://twittervideodownloader.com/download",
+            data=post_data,
+            headers=headers,
+            timeout=20,
+        )
+
+        if not resp.ok:
+            logger.warning(f"twittervideodownloader.com returned {resp.status_code}")
+            return None
+
+        html = resp.text
+
+        # Step 2: Extract video download links from the response
+        # Look for direct mp4 links — prefer highest quality
+        video_links = re.findall(
+            r'href=["\']( https?://[^"\']+\.mp4[^"\']*)["\']',
+            html, re.IGNORECASE
+        )
+        # Also try without .mp4 suffix (CDN links)
+        if not video_links:
+            video_links = re.findall(
+                r'href=["\']( https?://(?:video|pbs)\.twimg\.com/[^"\']+)["\']',
+                html, re.IGNORECASE
+            )
+        # Broader match — any download button link
+        if not video_links:
+            video_links = re.findall(
+                r'href=["\']( https?://[^"\']+(?:video|mp4|twimg)[^"\']*)["\']',
+                html, re.IGNORECASE
+            )
+        # Strip leading spaces from regex capture
+        video_links = [v.strip() for v in video_links]
+
+        if not video_links:
+            logger.warning("twittervideodownloader.com: no video links found in response")
+            return None
+
+        # Pick the first (usually highest quality) link
+        chosen = video_links[0]
+        logger.info(f"twittervideodownloader.com link: {chosen[:100]}")
+
+        # Step 3: Download the video
+        _update("⬇️ Downloading Twitter/X video...")
+        dl_headers = {
+            "User-Agent": headers["User-Agent"],
+            "Referer": "https://twittervideodownloader.com/",
+        }
+        dl_resp = session.get(chosen, headers=dl_headers, stream=True, timeout=120)
+        dl_resp.raise_for_status()
+
+        with open(output_path, "wb") as f:
+            for chunk in dl_resp.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            return {
+                "filepath": output_path,
+                "filename": os.path.basename(output_path),
+                "size_mb": round(size_mb, 2),
+            }
+
+    except Exception as e:
+        logger.warning(f"twittervideodownloader.com failed: {e}")
+
+    return None
 
 
 def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | None:
@@ -172,10 +292,27 @@ def download_video(
             "size_mb": round(size_mb, 2),
         }
 
-    # ── Try yt-dlp for known platforms (Twitter/X, YouTube, etc.) ────────
+    # ── Twitter/X: use twittervideodownloader.com ────────────────────────
     from urllib.parse import urlparse
     domain = urlparse(url).netloc.lower().replace("www.", "")
-    if any(d in domain for d in YTDLP_PREFERRED_DOMAINS):
+
+    if any(d in domain for d in TWITTER_DOMAINS):
+        _update("🐦 Twitter/X URL detected...")
+        unique_prefix = uuid.uuid4().hex[:8]
+        output_path = os.path.join(download_dir, f"{unique_prefix}_twitter.mp4")
+        result = _try_twitter_downloader(url, output_path, progress_callback=_update)
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+        _update("⚠️ twittervideodownloader.com failed, trying yt-dlp...")
+        result = _try_ytdlp(url, output_path, progress_callback=_update)
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+        _update("⚠️ yt-dlp also failed, trying page scraping...")
+
+    # ── Try yt-dlp for other known platforms (YouTube, Instagram, etc.) ──
+    elif any(d in domain for d in YTDLP_PREFERRED_DOMAINS):
         _update(f"🎬 Detected supported platform, trying yt-dlp...")
         unique_prefix = uuid.uuid4().hex[:8]
         output_path = os.path.join(download_dir, f"{unique_prefix}_video.mp4")
