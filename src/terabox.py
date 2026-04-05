@@ -10,7 +10,9 @@ import requests
 logger = logging.getLogger(__name__)
 
 TERABOX_DOMAINS = (
-    "terabox.com", "1024terabox.com", "freeterabox.com", "nephobox.com"
+    "terabox.com", "1024terabox.com", "freeterabox.com", "nephobox.com",
+    "terabox.app", "teraboxapp.com", "4funbox.com", "mirrobox.com",
+    "momerybox.com", "teraboxlink.com",
 )
 
 class TeraboxFile:

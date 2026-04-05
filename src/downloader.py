@@ -68,7 +68,9 @@ TWITTER_DOMAINS = ("x.com", "twitter.com")
 
 # Terabox domains
 TERABOX_DOMAINS = (
-    "terabox.com", "1024terabox.com", "freeterabox.com", "nephobox.com"
+    "terabox.com", "1024terabox.com", "freeterabox.com", "nephobox.com",
+    "terabox.app", "teraboxapp.com", "4funbox.com", "mirrobox.com",
+    "momerybox.com", "teraboxlink.com",
 )
 
 # Map CDN domains to their parent site referer
