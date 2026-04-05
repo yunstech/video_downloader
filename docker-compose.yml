@@ -66,6 +66,19 @@ services:
     # Scale workers: docker compose up --scale worker=2 (max for 2-core/8GB)
     restart: unless-stopped
 
+  terabox-worker:
+    build: .
+    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} terabox-downloads
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - downloads:/app/downloads
+    shm_size: 256m
+    mem_limit: 2g
+    restart: unless-stopped
+
   # Optional: RQ Dashboard for monitoring
   # rq-dashboard:
   #   image: eoranged/rq-dashboard

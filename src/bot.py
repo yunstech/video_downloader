@@ -28,13 +28,15 @@ from telegram.ext import (
 )
 
 from src import config
+from src.terabox import TERABOX_DOMAINS
 
 logger = logging.getLogger(__name__)
 
-# ── Redis & Queue ────────────────────────────────────────────────────────────
+# ── Redis & Queues ───────────────────────────────────────────────────────────
 
 redis_conn = Redis.from_url(config.REDIS_URL)
 queue = Queue("video-downloads", connection=redis_conn)
+terabox_queue = Queue("terabox-downloads", connection=redis_conn)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -90,6 +92,16 @@ def _validate_url(url: str) -> bool:
     return True
 
 
+def _is_terabox_url(url: str) -> bool:
+    """Check if a URL is a Terabox link."""
+    try:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+        return any(d in domain for d in TERABOX_DOMAINS)
+    except Exception:
+        return False
+
+
 # ── Command Handlers ─────────────────────────────────────────────────────────
 
 WELCOME_TEXT = """
@@ -131,12 +143,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     queued_count = queue.count
     started_registry = StartedJobRegistry(queue=queue)
     active_count = len(started_registry)
+
+    tb_queued = terabox_queue.count
+    tb_started_registry = StartedJobRegistry(queue=terabox_queue)
+    tb_active = len(tb_started_registry)
+
     user_jobs = _get_user_active_jobs(user_id)
 
     status_text = (
         f"📊 *Queue Status*\n\n"
-        f"📋 Queued: {queued_count}\n"
-        f"⚙️ Active: {active_count}\n"
+        f"📋 Downloads: {queued_count} queued, {active_count} active\n"
+        f"📦 Terabox: {tb_queued} queued, {tb_active} active\n"
         f"👤 Your jobs: {len(user_jobs)}\n"
     )
 
@@ -226,14 +243,18 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Send initial status message
+    is_terabox = _is_terabox_url(url)
+    target_queue = terabox_queue if is_terabox else queue
+    queue_label = "Terabox" if is_terabox else "download"
+
     status_msg = await update.message.reply_text(
-        f"⏳ Queued for download (position #{queue.count + 1})\n"
+        f"⏳ Queued for {queue_label} (position #{target_queue.count + 1})\n"
         f"🔗 {url[:80]}{'...' if len(url) > 80 else ''}"
     )
 
     # Enqueue the job
     try:
-        job = queue.enqueue(
+        job = target_queue.enqueue(
             "src.tasks.download_and_upload",
             args=(url, chat_id, status_msg.message_id),
             job_timeout=config.DOWNLOAD_TIMEOUT,
@@ -244,12 +265,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _track_user_job(user_id, job.id)
 
         logger.info(
-            f"Job {job.id[:8]} enqueued for user {user_id}: {url[:80]}"
+            f"Job {job.id[:8]} enqueued on '{target_queue.name}' for user {user_id}: {url[:80]}"
         )
 
         # Update message with job ID
         await status_msg.edit_text(
-            f"⏳ Queued for download (position #{queue.count})\n"
+            f"⏳ Queued for {queue_label} (position #{target_queue.count})\n"
             f"🔗 {url[:80]}{'...' if len(url) > 80 else ''}\n"
             f"🆔 Job: {job.id[:8]}"
         )
