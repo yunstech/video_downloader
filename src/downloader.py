@@ -926,21 +926,23 @@ def download_video(
         size_mb = fileinfo.get("size", 0) / (1024 * 1024)
         _update(f"🔗 Generating download link for: {fname} ({size_mb:.1f} MB)")
 
-        dl_url = tb.get_download_link(fileinfo["fs_id"])
-        if not dl_url:
-            raise RuntimeError("Failed to generate Terabox download link.")
-
         unique_prefix = uuid.uuid4().hex[:8]
         safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
         filename = f"{unique_prefix}_{safe_name}"
         output_path = os.path.join(download_dir, filename)
-        result = _download_direct_with_headers(
-            dl_url, output_path, referer=url, progress_callback=_update
+
+        # Use TeraboxDownloader's own download method (cloudscraper + retries)
+        result = tb.download_file(
+            fs_id=fileinfo["fs_id"],
+            output_path=output_path,
+            referer=url,
+            max_retries=3,
+            progress_callback=_update,
         )
         if result:
             _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
             return result
-        raise RuntimeError("Terabox download failed.")
+        raise RuntimeError("Terabox download failed after all retries.")
 
     # ── Check if this is a CDN direct URL (phncdn.com, etc.) ─────────────
     is_adult_cdn = any(d in domain for d in ADULT_CDN_DOMAINS)

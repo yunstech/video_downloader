@@ -202,6 +202,137 @@ class TeraboxDownloader:
 
         return None
 
+    def download_file(
+        self,
+        fs_id: str,
+        output_path: str,
+        referer: str = "",
+        max_retries: int = 3,
+        progress_callback=None,
+    ) -> dict | None:
+        """
+        Download a file from Terabox with retries and download-link regeneration.
+
+        Uses the cloudscraper session (TLS fingerprint + cookies) which is
+        required by the Terabox CDN. Regenerates the download link on each
+        retry because Terabox links are short-lived and often single-use.
+
+        Returns dict with filepath/filename/size_mb on success, None on failure.
+        """
+        import os
+
+        def _update(text):
+            logger.info(text)
+            if progress_callback:
+                try:
+                    progress_callback(text)
+                except Exception:
+                    pass
+
+        dl_headers = {
+            "User-Agent": UA,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive",
+            "Referer": referer or f"https://www.terabox.app/",
+        }
+
+        for attempt in range(1, max_retries + 1):
+            # (Re)generate download link on every attempt
+            dl_url = self.get_download_link(fs_id)
+            if not dl_url:
+                logger.warning(f"Terabox download attempt {attempt}/{max_retries}: "
+                               "failed to generate download link")
+                if attempt < max_retries:
+                    time.sleep(2)
+                continue
+
+            try:
+                _update(f"⬇️ Downloading (attempt {attempt}/{max_retries})...")
+                logger.debug(f"Terabox download URL: {dl_url[:150]}")
+
+                # Use cloudscraper session for TLS fingerprint compatibility
+                resp = self.sc.get(
+                    dl_url,
+                    headers=dl_headers,
+                    stream=True,
+                    timeout=120,
+                    allow_redirects=True,
+                )
+                logger.debug(
+                    f"Terabox download response: status={resp.status_code}, "
+                    f"content-type={resp.headers.get('content-type', '?')}, "
+                    f"content-length={resp.headers.get('content-length', '?')}"
+                )
+                resp.raise_for_status()
+
+                # Reject HTML error pages
+                content_type = resp.headers.get("content-type", "").lower()
+                if "text/html" in content_type:
+                    logger.warning(f"Terabox attempt {attempt}: got HTML instead of file")
+                    if attempt < max_retries:
+                        time.sleep(2)
+                    continue
+
+                total_bytes = int(resp.headers.get("content-length", 0))
+                bytes_written = 0
+
+                with open(output_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                            bytes_written += len(chunk)
+                            if total_bytes and bytes_written % (1024 * 1024 * 5) < 65536:
+                                pct = bytes_written / total_bytes * 100
+                                _update(f"⬇️ Progress: {pct:.0f}% "
+                                        f"({bytes_written // 1024 // 1024} MB / "
+                                        f"{total_bytes // 1024 // 1024} MB)")
+
+                # Validate downloaded file
+                if os.path.exists(output_path):
+                    file_size = os.path.getsize(output_path)
+
+                    # Check for HTML error pages disguised as files
+                    with open(output_path, "rb") as f:
+                        header = f.read(64)
+                    if b"<html" in header.lower() or b"<!doctype" in header.lower():
+                        logger.warning(f"Terabox attempt {attempt}: downloaded HTML, not file")
+                        os.remove(output_path)
+                        if attempt < max_retries:
+                            time.sleep(2)
+                        continue
+
+                    if file_size > 1024:  # at least 1 KB
+                        size_mb = file_size / (1024 * 1024)
+                        logger.info(f"Terabox: downloaded {size_mb:.2f} MB to {output_path}")
+                        return {
+                            "filepath": output_path,
+                            "filename": os.path.basename(output_path),
+                            "size_mb": round(size_mb, 2),
+                        }
+                    else:
+                        logger.warning(f"Terabox attempt {attempt}: file too small ({file_size} bytes)")
+                        os.remove(output_path)
+
+            except Exception as e:
+                logger.warning(
+                    f"Terabox download attempt {attempt}/{max_retries} failed: {e}",
+                    exc_info=(attempt == max_retries),
+                )
+                # Clean up partial file
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+
+            if attempt < max_retries:
+                wait = attempt * 2
+                _update(f"⏳ Retrying in {wait}s...")
+                time.sleep(wait)
+
+        return None
+
     # ── HNN Workers Proxy Methods ────────────────────────────────────────
 
     def _hnn_get_info(self, surl: str) -> dict | None:
