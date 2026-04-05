@@ -5,6 +5,7 @@ Provides a clean API for downloading videos without going through
 the CLI argparse interface.
 """
 import os
+import re
 import uuid
 import logging
 
@@ -18,7 +19,7 @@ from src.video_downloader import (
     VIDEO_EXTENSIONS,
 )
 from src import config
-from src.terabox import TeraboxFile, TeraboxLink
+from src.terabox import TeraboxDownloader
 
 # Minimum file size in bytes to consider a download valid (100 KB)
 # Anything smaller is likely an error page, empty file, or ad stub
@@ -902,38 +903,36 @@ def download_video(
     domain = parsed.netloc.lower().replace("www.", "")
     logger.debug(f"Parsed domain: {domain}")
 
-    # ── Terabox: use TeraDL logic ─────────────────────────────────────────────
+    # ── Terabox: hybrid proxy + native API ───────────────────────────────────
     if any(d in domain for d in TERABOX_DOMAINS):
         _update("📦 Terabox detected, extracting file info...")
-        tf = TeraboxFile()
-        tf.search(url)
-        if tf.result.get('status') != 'success' or not tf.result.get('list'):
-            raise RuntimeError("Failed to extract Terabox file info. The link may be invalid or expired.")
-        # Pick the first file (or allow user to select in future)
+        tb = TeraboxDownloader()
+        info = tb.get_file_info(url)
+        if info.get("status") != "success" or not info.get("list"):
+            err = info.get("error", "Unknown error")
+            raise RuntimeError(f"Failed to extract Terabox file info: {err}")
+
+        # Pick first downloadable file (prefer video, then any)
+        file_list = info["list"]
         fileinfo = None
-        for f in tf.result['list']:
-            if not f.get('is_dir'):
+        for f in file_list:
+            if f.get("type") == "video":
                 fileinfo = f
                 break
         if not fileinfo:
-            raise RuntimeError("No downloadable file found in this Terabox link.")
-        _update(f"🔗 Generating download link for: {fileinfo['name']}")
-        tl = TeraboxLink(
-            tf.result['shareid'],
-            tf.result['uk'],
-            tf.result['sign'],
-            tf.result['timestamp'],
-            fileinfo['fs_id']
-        )
-        tl.generate()
-        if tl.result.get('status') != 'success' or not tl.result['download_link']:
-            raise RuntimeError("Failed to generate Terabox download link.")
-        # Prefer url_1, fallback to url_2
-        dl_url = tl.result['download_link'].get('url_1') or tl.result['download_link'].get('url_2')
+            fileinfo = file_list[0]
+
+        fname = fileinfo.get("filename", "unknown")
+        size_mb = fileinfo.get("size", 0) / (1024 * 1024)
+        _update(f"🔗 Generating download link for: {fname} ({size_mb:.1f} MB)")
+
+        dl_url = tb.get_download_link(fileinfo["fs_id"])
         if not dl_url:
-            raise RuntimeError("No valid Terabox download URL found.")
+            raise RuntimeError("Failed to generate Terabox download link.")
+
         unique_prefix = uuid.uuid4().hex[:8]
-        filename = f"{unique_prefix}_{fileinfo['name']}"
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
+        filename = f"{unique_prefix}_{safe_name}"
         output_path = os.path.join(download_dir, filename)
         result = _download_direct_with_headers(
             dl_url, output_path, referer=url, progress_callback=_update
