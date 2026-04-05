@@ -136,6 +136,7 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
     """
     start_time = time.time()
     filepath = None
+    extra_filepaths = []
 
     logger.info(f"[TASK START] url={url} chat_id={chat_id} status_msg={status_message_id}")
 
@@ -233,22 +234,65 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
         caption = f"📹 {result['filename']}\n📦 {size_mb:.1f} MB"
         _send_video(chat_id, filepath, caption=caption)
 
+        # ── Upload extra files (multi-file Terabox downloads) ────────────
+        extra_files = result.get("extra_files", [])
+        uploaded_count = 1  # already uploaded the first one
+        extra_filepaths = []  # track for cleanup
+
+        for extra in extra_files:
+            extra_fp = extra.get("filepath", "")
+            extra_filepaths.append(extra_fp)
+            extra_size = extra.get("size_mb", 0)
+
+            if extra_size > config.MAX_FILE_SIZE_MB:
+                logger.warning(f"Extra file too large ({extra_size:.1f} MB): {extra_fp}")
+                _edit_message(
+                    chat_id,
+                    status_message_id,
+                    f"⚠️ Skipping {extra['filename']} — too large ({extra_size:.1f} MB)",
+                )
+                continue
+
+            try:
+                _edit_message(
+                    chat_id,
+                    status_message_id,
+                    f"⬆️ Uploading [{uploaded_count + 1}/{1 + len(extra_files)}] "
+                    f"({extra_size:.1f} MB)...",
+                )
+                extra_caption = f"📹 {extra['filename']}\n📦 {extra_size:.1f} MB"
+                _send_video(chat_id, extra_fp, caption=extra_caption)
+                uploaded_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to upload extra file {extra_fp}: {e}")
+
         # ── Final status ─────────────────────────────────────────────────
+        total_uploaded_mb = size_mb + sum(
+            ef.get("size_mb", 0) for ef in extra_files
+        )
         elapsed = time.time() - start_time
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
         time_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
 
-        _edit_message(
-            chat_id,
-            status_message_id,
-            f"✅ Complete! ({size_mb:.1f} MB, {time_str})",
-        )
+        if uploaded_count > 1:
+            _edit_message(
+                chat_id,
+                status_message_id,
+                f"✅ Complete! {uploaded_count} files ({total_uploaded_mb:.1f} MB, {time_str})",
+            )
+        else:
+            _edit_message(
+                chat_id,
+                status_message_id,
+                f"✅ Complete! ({size_mb:.1f} MB, {time_str})",
+            )
 
         return {
             "status": "success",
             "filename": result["filename"],
             "size_mb": size_mb,
+            "files_uploaded": uploaded_count,
             "elapsed_seconds": round(elapsed, 1),
         }
 
@@ -278,3 +322,12 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
                 logger.info(f"Cleaned up: {filepath}")
             except OSError as e:
                 logger.warning(f"Cleanup failed for {filepath}: {e}")
+
+        # Clean up extra files from multi-file downloads
+        for efp in extra_filepaths:
+            if efp and os.path.exists(efp):
+                try:
+                    os.remove(efp)
+                    logger.info(f"Cleaned up extra: {efp}")
+                except OSError as e:
+                    logger.warning(f"Cleanup failed for extra {efp}: {e}")

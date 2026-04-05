@@ -73,6 +73,15 @@ def _extract_surl(url: str) -> str | None:
     return None
 
 
+def _extract_path(url: str) -> str | None:
+    """Extract the path query parameter from a Terabox sharing link."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    if "path" in qs:
+        return qs["path"][0]
+    return None
+
+
 def _get_base_url(url: str) -> str:
     """Get the base URL (scheme + host) from a Terabox URL."""
     parsed = urlparse(url)
@@ -121,22 +130,27 @@ class TeraboxDownloader:
         """
         Get file info from a Terabox share URL.
 
+        If the URL contains a path= query parameter, only files from that
+        specific subdirectory are returned. Otherwise, all files are flattened
+        from the root.
+
         Returns dict with keys: status, list, error
         Each item in list: filename, fs_id, size, is_dir, path, type
         """
         result = {"status": "failed", "list": [], "error": ""}
 
-        # Step 1: Extract surl
+        # Step 1: Extract surl and optional path
         self.surl = _extract_surl(url)
         if not self.surl:
             result["error"] = "Could not extract share URL code"
             logger.warning(f"Terabox: could not extract surl from {url}")
             return result
 
+        target_path = _extract_path(url)
         self.base_url = _get_base_url(url)
-        logger.info(f"Terabox: surl={self.surl}, base={self.base_url}")
+        logger.info(f"Terabox: surl={self.surl}, base={self.base_url}, path={target_path}")
 
-        # Step 2: Get info from hnn workers proxy
+        # Step 2: Get info from hnn workers proxy (for sign/timestamp/shareid/uk)
         hnn_data = self._hnn_get_info(self.surl)
         if not hnn_data:
             result["error"] = "Failed to get file info from proxy API"
@@ -148,14 +162,28 @@ class TeraboxDownloader:
         self.uk = str(hnn_data.get("uk", ""))
         self.randsk = hnn_data.get("randsk", "")
 
-        # Step 3: Flatten file list (navigate subdirectories)
-        raw_list = hnn_data.get("list", [])
-        all_files = self._flatten_files(raw_list)
+        # Step 3: Get file list
+        all_files = []
 
-        if not all_files:
-            # Fallback: try native Terabox API with cookies
-            logger.info("Terabox: hnn returned no files in subdirs, trying native API")
-            all_files = self._native_get_files(url)
+        if target_path:
+            # URL has path= param — use native API to list that specific directory
+            logger.info(f"Terabox: targeting specific path: {target_path}")
+            all_files = self._native_get_path_files(url, target_path)
+
+            # Fallback: try hnn proxy for the targeted path
+            if not all_files:
+                children = self._hnn_list_dir(target_path)
+                if children:
+                    all_files = self._flatten_files(children)
+        else:
+            # No path param — flatten everything from root
+            raw_list = hnn_data.get("list", [])
+            all_files = self._flatten_files(raw_list)
+
+            if not all_files:
+                # Fallback: try native Terabox API with cookies
+                logger.info("Terabox: hnn returned no files, trying native API")
+                all_files = self._native_get_files(url)
 
         if not all_files:
             result["error"] = "No downloadable files found in this share link"
@@ -426,6 +454,36 @@ class TeraboxDownloader:
         return result
 
     # ── Native Terabox API Methods (cookie-based) ────────────────────────
+
+    def _native_get_path_files(self, url: str, target_path: str) -> list:
+        """Get files from a specific path using native Terabox API."""
+        try:
+            # Visit share page to establish cookies
+            self.native_session.get(url, allow_redirects=True, timeout=15)
+            base = self.base_url or "https://www.terabox.app"
+
+            # Get shareid/uk from shorturlinfo
+            api_url = f"{base}/api/shorturlinfo?app_id=250528&shorturl=1{self.surl}&root=1"
+            resp = self.native_session.get(api_url, timeout=15)
+            data = resp.json()
+            if data.get("errno", 0) != 0:
+                logger.warning(f"Terabox: native API errno={data.get('errno')}")
+                return []
+
+            if not self.shareid and data.get("shareid"):
+                self.shareid = str(data["shareid"])
+            if not self.uk and data.get("uk"):
+                self.uk = str(data["uk"])
+
+            # List the specific directory
+            children = self._native_list_dir(target_path, base)
+            if children:
+                return self._flatten_native_list(children, base)
+
+            return []
+        except Exception as e:
+            logger.warning(f"Terabox: native path API failed: {e}")
+            return []
 
     def _native_get_files(self, url: str) -> list:
         """Get files using native Terabox API with session cookies."""

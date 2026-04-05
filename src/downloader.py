@@ -912,37 +912,51 @@ def download_video(
             err = info.get("error", "Unknown error")
             raise RuntimeError(f"Failed to extract Terabox file info: {err}")
 
-        # Pick first downloadable file (prefer video, then any)
         file_list = info["list"]
-        fileinfo = None
-        for f in file_list:
-            if f.get("type") == "video":
-                fileinfo = f
-                break
-        if not fileinfo:
-            fileinfo = file_list[0]
+        # Filter to video files; if none, use all files
+        videos = [f for f in file_list if f.get("type") == "video"]
+        targets = videos if videos else file_list
 
-        fname = fileinfo.get("filename", "unknown")
-        size_mb = fileinfo.get("size", 0) / (1024 * 1024)
-        _update(f"🔗 Generating download link for: {fname} ({size_mb:.1f} MB)")
+        total_count = len(targets)
+        total_size = sum(f.get("size", 0) for f in targets) / (1024 * 1024)
+        _update(f"📁 Found {total_count} file(s) ({total_size:.1f} MB total)")
 
-        unique_prefix = uuid.uuid4().hex[:8]
-        safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
-        filename = f"{unique_prefix}_{safe_name}"
-        output_path = os.path.join(download_dir, filename)
+        downloaded = []
+        for idx, fileinfo in enumerate(targets, 1):
+            fname = fileinfo.get("filename", "unknown")
+            size_mb = fileinfo.get("size", 0) / (1024 * 1024)
+            _update(f"🔗 [{idx}/{total_count}] Downloading: {fname} ({size_mb:.1f} MB)")
 
-        # Use TeraboxDownloader's own download method (cloudscraper + retries)
-        result = tb.download_file(
-            fs_id=fileinfo["fs_id"],
-            output_path=output_path,
-            referer=url,
-            max_retries=3,
-            progress_callback=_update,
-        )
-        if result:
-            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
-            return result
-        raise RuntimeError("Terabox download failed after all retries.")
+            unique_prefix = uuid.uuid4().hex[:8]
+            safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
+            filename = f"{unique_prefix}_{safe_name}"
+            output_path = os.path.join(download_dir, filename)
+
+            result = tb.download_file(
+                fs_id=fileinfo["fs_id"],
+                output_path=output_path,
+                referer=url,
+                max_retries=3,
+                progress_callback=_update,
+            )
+            if result:
+                downloaded.append(result)
+                _update(f"✅ [{idx}/{total_count}] Done: {fname} ({result['size_mb']:.1f} MB)")
+            else:
+                logger.warning(f"Terabox: failed to download [{idx}/{total_count}]: {fname}")
+                _update(f"⚠️ [{idx}/{total_count}] Failed: {fname}")
+
+        if not downloaded:
+            raise RuntimeError("Terabox: failed to download any files.")
+
+        if len(downloaded) == 1:
+            return downloaded[0]
+
+        # Multiple files: return the first one with a 'extra_files' key for the rest
+        first = downloaded[0]
+        first["extra_files"] = downloaded[1:]
+        _update(f"✅ All done! Downloaded {len(downloaded)}/{total_count} files.")
+        return first
 
     # ── Check if this is a CDN direct URL (phncdn.com, etc.) ─────────────
     is_adult_cdn = any(d in domain for d in ADULT_CDN_DOMAINS)
