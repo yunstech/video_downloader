@@ -18,6 +18,7 @@ from src.video_downloader import (
     VIDEO_EXTENSIONS,
 )
 from src import config
+from src.terabox import TeraboxFile, TeraboxLink
 
 # Minimum file size in bytes to consider a download valid (100 KB)
 # Anything smaller is likely an error page, empty file, or ad stub
@@ -61,8 +62,14 @@ ADULT_CDN_DOMAINS = (
     "rdtcdn.com",       # RedTube CDN
 )
 
+
 # Twitter/X domains
 TWITTER_DOMAINS = ("x.com", "twitter.com")
+
+# Terabox domains
+TERABOX_DOMAINS = (
+    "terabox.com", "1024terabox.com", "freeterabox.com", "nephobox.com"
+)
 
 # Map CDN domains to their parent site referer
 CDN_REFERER_MAP = {
@@ -892,6 +899,47 @@ def download_video(
     parsed = urlparse(url)
     domain = parsed.netloc.lower().replace("www.", "")
     logger.debug(f"Parsed domain: {domain}")
+
+    # ── Terabox: use TeraDL logic ─────────────────────────────────────────────
+    if any(d in domain for d in TERABOX_DOMAINS):
+        _update("📦 Terabox detected, extracting file info...")
+        tf = TeraboxFile()
+        tf.search(url)
+        if tf.result.get('status') != 'success' or not tf.result.get('list'):
+            raise RuntimeError("Failed to extract Terabox file info. The link may be invalid or expired.")
+        # Pick the first file (or allow user to select in future)
+        fileinfo = None
+        for f in tf.result['list']:
+            if not f.get('is_dir'):
+                fileinfo = f
+                break
+        if not fileinfo:
+            raise RuntimeError("No downloadable file found in this Terabox link.")
+        _update(f"🔗 Generating download link for: {fileinfo['name']}")
+        tl = TeraboxLink(
+            tf.result['shareid'],
+            tf.result['uk'],
+            tf.result['sign'],
+            tf.result['timestamp'],
+            fileinfo['fs_id']
+        )
+        tl.generate()
+        if tl.result.get('status') != 'success' or not tl.result['download_link']:
+            raise RuntimeError("Failed to generate Terabox download link.")
+        # Prefer url_1, fallback to url_2
+        dl_url = tl.result['download_link'].get('url_1') or tl.result['download_link'].get('url_2')
+        if not dl_url:
+            raise RuntimeError("No valid Terabox download URL found.")
+        unique_prefix = uuid.uuid4().hex[:8]
+        filename = f"{unique_prefix}_{fileinfo['name']}"
+        output_path = os.path.join(download_dir, filename)
+        result = _download_direct_with_headers(
+            dl_url, output_path, referer=url, progress_callback=_update
+        )
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+        raise RuntimeError("Terabox download failed.")
 
     # ── Check if this is a CDN direct URL (phncdn.com, etc.) ─────────────
     is_adult_cdn = any(d in domain for d in ADULT_CDN_DOMAINS)
