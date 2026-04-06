@@ -13,10 +13,12 @@ Based on: https://github.com/Dapunta/TeraDL
 import re
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urlparse, parse_qs
 
 import cloudscraper
 import requests
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,16 @@ class TeraboxDownloader:
         self.sc = cloudscraper.create_scraper()
         self.native_session = requests.Session()
         self.native_session.headers.update({"User-Agent": UA})
+        # Separate plain requests session for large file downloads.
+        # cloudscraper buffers full responses in memory for challenge
+        # detection, which causes OOM on large files. CDN download URLs
+        # (e.g. dm-d.1024tera.com) don't need Cloudflare bypass.
+        self.dl_session = requests.Session()
+        self.dl_session.headers.update({"User-Agent": UA})
+        # Connection pool: reuse TCP connections across multiple file downloads
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+        self.dl_session.mount("https://", adapter)
+        self.dl_session.mount("http://", adapter)
         self.sign = ""
         self.timestamp = ""
         self.shareid = ""
@@ -241,9 +253,11 @@ class TeraboxDownloader:
         """
         Download a file from Terabox with retries and download-link regeneration.
 
-        Uses the cloudscraper session (TLS fingerprint + cookies) which is
-        required by the Terabox CDN. Regenerates the download link on each
-        retry because Terabox links are short-lived and often single-use.
+        Uses a plain requests session for streaming downloads to avoid
+        cloudscraper's memory buffering (which causes OOM on large files).
+        CDN download URLs don't need Cloudflare bypass.
+        Regenerates the download link on each retry because Terabox links
+        are short-lived and often single-use.
 
         Returns dict with filepath/filename/size_mb on success, None on failure.
         """
@@ -279,12 +293,14 @@ class TeraboxDownloader:
                 _update(f"⬇️ Downloading (attempt {attempt}/{max_retries})...")
                 logger.debug(f"Terabox download URL: {dl_url[:150]}")
 
-                # Use cloudscraper session for TLS fingerprint compatibility
-                resp = self.sc.get(
+                # Use plain requests session for file downloads to avoid
+                # cloudscraper buffering entire response in memory (OOM).
+                # CDN URLs (dm-d.1024tera.com etc.) don't need CF bypass.
+                resp = self.dl_session.get(
                     dl_url,
                     headers=dl_headers,
                     stream=True,
-                    timeout=120,
+                    timeout=(15, 300),  # (connect, read) — large files need long read timeout
                     allow_redirects=True,
                 )
                 logger.debug(
@@ -297,6 +313,7 @@ class TeraboxDownloader:
                 # Reject HTML error pages
                 content_type = resp.headers.get("content-type", "").lower()
                 if "text/html" in content_type:
+                    resp.close()
                     logger.warning(f"Terabox attempt {attempt}: got HTML instead of file")
                     if attempt < max_retries:
                         time.sleep(2)
@@ -305,16 +322,19 @@ class TeraboxDownloader:
                 total_bytes = int(resp.headers.get("content-length", 0))
                 bytes_written = 0
 
-                with open(output_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            f.write(chunk)
-                            bytes_written += len(chunk)
-                            if total_bytes and bytes_written % (1024 * 1024 * 5) < 65536:
-                                pct = bytes_written / total_bytes * 100
-                                _update(f"⬇️ Progress: {pct:.0f}% "
-                                        f"({bytes_written // 1024 // 1024} MB / "
-                                        f"{total_bytes // 1024 // 1024} MB)")
+                try:
+                    with open(output_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):  # 1 MB chunks
+                            if chunk:
+                                f.write(chunk)
+                                bytes_written += len(chunk)
+                                if total_bytes and bytes_written % (1024 * 1024 * 10) < 1024 * 1024:
+                                    pct = bytes_written / total_bytes * 100
+                                    _update(f"⬇️ Progress: {pct:.0f}% "
+                                            f"({bytes_written // 1024 // 1024} MB / "
+                                            f"{total_bytes // 1024 // 1024} MB)")
+                finally:
+                    resp.close()
 
                 # Validate downloaded file
                 if os.path.exists(output_path):
@@ -360,6 +380,86 @@ class TeraboxDownloader:
                 time.sleep(wait)
 
         return None
+
+    def download_files(
+        self,
+        files: list[dict],
+        download_dir: str,
+        referer: str = "",
+        max_workers: int = 3,
+        progress_callback=None,
+    ) -> list[dict]:
+        """
+        Download multiple Terabox files concurrently.
+
+        Args:
+            files: List of file dicts with keys: fs_id, filename, size, type
+            download_dir: Directory to save files to
+            referer: Referer URL for download headers
+            max_workers: Max concurrent downloads (default 3)
+            progress_callback: Callback for status updates
+
+        Returns:
+            List of successfully downloaded result dicts.
+        """
+        import os
+
+        def _update(text):
+            logger.info(text)
+            if progress_callback:
+                try:
+                    progress_callback(text)
+                except Exception:
+                    pass
+
+        total_count = len(files)
+        results = [None] * total_count  # preserve order
+
+        def _download_one(idx_and_file):
+            idx, fileinfo = idx_and_file
+            fname = fileinfo.get("filename", "unknown")
+            safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
+            import uuid
+            filename = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+            output_path = os.path.join(download_dir, filename)
+
+            result = self.download_file(
+                fs_id=fileinfo["fs_id"],
+                output_path=output_path,
+                referer=referer,
+                max_retries=3,
+                progress_callback=None,  # avoid noisy per-chunk updates from threads
+            )
+            return idx, fname, result
+
+        _update(f"⚡ Downloading {total_count} files ({max_workers} parallel)...")
+
+        completed = 0
+        failed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_download_one, (i, f)): i
+                for i, f in enumerate(files)
+            }
+            for future in as_completed(futures):
+                try:
+                    idx, fname, result = future.result()
+                    if result:
+                        results[idx] = result
+                        completed += 1
+                        size = result['size_mb']
+                        _update(f"✅ [{completed + failed}/{total_count}] {fname} ({size:.1f} MB)")
+                    else:
+                        failed += 1
+                        _update(f"⚠️ [{completed + failed}/{total_count}] Failed: {fname}")
+                        logger.warning(f"Terabox: failed to download: {fname}")
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"Terabox: download thread error: {e}")
+
+        downloaded = [r for r in results if r is not None]
+        _update(f"📊 Downloaded {len(downloaded)}/{total_count} files")
+        return downloaded
 
     # ── HNN Workers Proxy Methods ────────────────────────────────────────
 

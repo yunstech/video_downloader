@@ -921,16 +921,16 @@ def download_video(
         total_size = sum(f.get("size", 0) for f in targets) / (1024 * 1024)
         _update(f"📁 Found {total_count} file(s) ({total_size:.1f} MB total)")
 
-        downloaded = []
-        for idx, fileinfo in enumerate(targets, 1):
+        if total_count == 1:
+            # Single file: download directly with progress updates
+            fileinfo = targets[0]
             fname = fileinfo.get("filename", "unknown")
             size_mb = fileinfo.get("size", 0) / (1024 * 1024)
-            _update(f"🔗 [{idx}/{total_count}] Downloading: {fname} ({size_mb:.1f} MB)")
+            _update(f"🔗 Downloading: {fname} ({size_mb:.1f} MB)")
 
             unique_prefix = uuid.uuid4().hex[:8]
             safe_name = re.sub(r'[<>:"/\\|?*]', '_', fname)
-            filename = f"{unique_prefix}_{safe_name}"
-            output_path = os.path.join(download_dir, filename)
+            output_path = os.path.join(download_dir, f"{unique_prefix}_{safe_name}")
 
             result = tb.download_file(
                 fs_id=fileinfo["fs_id"],
@@ -940,11 +940,18 @@ def download_video(
                 progress_callback=_update,
             )
             if result:
-                downloaded.append(result)
-                _update(f"✅ [{idx}/{total_count}] Done: {fname} ({result['size_mb']:.1f} MB)")
-            else:
-                logger.warning(f"Terabox: failed to download [{idx}/{total_count}]: {fname}")
-                _update(f"⚠️ [{idx}/{total_count}] Failed: {fname}")
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
+            raise RuntimeError("Terabox download failed after all retries.")
+
+        # Multiple files: download concurrently (3 parallel)
+        downloaded = tb.download_files(
+            files=targets,
+            download_dir=download_dir,
+            referer=url,
+            max_workers=3,
+            progress_callback=_update,
+        )
 
         if not downloaded:
             raise RuntimeError("Terabox: failed to download any files.")
