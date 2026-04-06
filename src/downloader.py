@@ -285,14 +285,14 @@ def _try_twitter_downloader(url: str, output_path: str, progress_callback=None) 
                 "Referer": "https://twittervideodownloader.com/",
             },
             stream=True,
-            timeout=120,
+            timeout=(15, 300),
         )
         logger.debug(f"Video download status: {dl_resp.status_code}, content-type: {dl_resp.headers.get('content-type', '?')}")
         dl_resp.raise_for_status()
 
         bytes_written = 0
         with open(output_path, "wb") as f:
-            for chunk in dl_resp.iter_content(chunk_size=65536):
+            for chunk in dl_resp.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     bytes_written += len(chunk)
@@ -605,7 +605,7 @@ def _download_direct_with_headers(
         logger.debug(f"Direct download: {url[:120]}")
         logger.debug(f"Headers: Referer={referer}")
 
-        resp = req.get(url, headers=headers, stream=True, timeout=120)
+        resp = req.get(url, headers=headers, stream=True, timeout=(15, 300))
         logger.debug(
             f"Response: status={resp.status_code}, "
             f"content-type={resp.headers.get('content-type', '?')}, "
@@ -623,11 +623,11 @@ def _download_direct_with_headers(
         bytes_written = 0
 
         with open(output_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     bytes_written += len(chunk)
-                    if total_bytes and bytes_written % (1024 * 1024 * 5) < 65536:
+                    if total_bytes and bytes_written % (1024 * 1024 * 10) < 1024 * 1024:
                         pct = bytes_written / total_bytes * 100
                         logger.debug(
                             f"Progress: {pct:.1f}% "

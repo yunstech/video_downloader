@@ -283,6 +283,10 @@ class TeraboxDownloader:
                     pass
 
         aria2c_available = shutil.which("aria2c") is not None
+        if aria2c_available:
+            logger.info("Terabox: aria2c found — will use as primary downloader")
+        else:
+            logger.warning("Terabox: aria2c NOT found — falling back to requests (may fail on large files)")
 
         for attempt in range(1, max_retries + 1):
             # (Re)generate download link on every attempt — links are short-lived
@@ -297,8 +301,8 @@ class TeraboxDownloader:
             _update(f"⬇️ Downloading (attempt {attempt}/{max_retries})...")
             logger.debug(f"Terabox download URL: {dl_url[:150]}")
 
-            # Clean up any leftover partial file
-            if os.path.exists(output_path):
+            # Clean up any leftover partial file (but NOT for aria2c which can resume)
+            if not aria2c_available and os.path.exists(output_path):
                 os.remove(output_path)
 
             success = False
@@ -350,31 +354,35 @@ class TeraboxDownloader:
             "aria2c",
             "--out", out_file,
             "--dir", out_dir,
-            "--max-connection-per-server=4",  # 4 connections per server (Terabox allows it)
-            "--split=4",                       # split file into 4 parts
+            "--max-connection-per-server=4",
+            "--split=4",
             "--min-split-size=10M",
-            "--max-tries=3",
-            "--retry-wait=3",
+            "--max-tries=5",
+            "--retry-wait=5",
             "--connect-timeout=15",
-            "--timeout=60",
+            "--timeout=120",
+            "--continue=true",                 # resume partial downloads
             "--auto-file-renaming=false",
             "--allow-overwrite=true",
-            "--quiet=true",
+            "--console-log-level=warn",        # show warnings/errors
+            "--summary-interval=0",            # suppress progress summary
             f"--user-agent={UA}",
             f"--referer={referer or 'https://www.terabox.app/'}",
             "--header=Accept: */*",
             "--header=Accept-Encoding: identity",
             url,
         ]
-        logger.debug(f"aria2c: {' '.join(cmd[:8])}...")
+        logger.info(f"aria2c: starting download for {out_file}")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
             if result.returncode == 0 and os.path.exists(output_path):
-                logger.info(f"aria2c: success for {out_file}")
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                logger.info(f"aria2c: success for {out_file} ({size_mb:.1f} MB)")
                 return True
-            logger.warning(f"aria2c failed (rc={result.returncode}): {result.stderr[:200]}")
+            logger.warning(f"aria2c failed (rc={result.returncode}): "
+                           f"stderr={result.stderr[:300]} stdout={result.stdout[:200]}")
         except subprocess.TimeoutExpired:
-            logger.warning("aria2c: timed out after 600s")
+            logger.warning("aria2c: timed out after 1800s")
         except Exception as e:
             logger.warning(f"aria2c error: {e}")
         return False
