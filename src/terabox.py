@@ -16,7 +16,6 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urlparse, parse_qs
 
-import cloudscraper
 import requests
 from requests.adapters import HTTPAdapter
 
@@ -29,25 +28,31 @@ TERABOX_DOMAINS = (
 )
 
 HNN_API_BASE = "https://terabox.hnn.workers.dev"
-HNN_HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "referer": f"{HNN_API_BASE}/",
-    "origin": HNN_API_BASE,
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/134.0.0.0 Safari/537.36"
-    ),
-}
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/143.0.0.0 Safari/537.36"
 )
+
+# Headers that match what the hnn workers.dev proxy expects (Chrome 143 fingerprint)
+HNN_HEADERS = {
+    "Accept": "*/*",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Priority": "u=1, i",
+    "Referer": f"{HNN_API_BASE}/",
+    "Origin": HNN_API_BASE,
+    "User-Agent": UA,
+}
 
 
 def _extract_surl(url: str) -> str | None:
@@ -117,7 +122,14 @@ class TeraboxDownloader:
     """
 
     def __init__(self):
-        self.sc = cloudscraper.create_scraper()
+        # API session — plain requests with Chrome 143 headers (no cloudscraper needed,
+        # the hnn workers.dev proxy handles Cloudflare on the Terabox side)
+        self.sc = requests.Session()
+        self.sc.headers.update(HNN_HEADERS)
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2)
+        self.sc.mount("https://", adapter)
+        self.sc.mount("http://", adapter)
+
         self.native_session = requests.Session()
         self.native_session.headers.update({"User-Agent": UA})
         # Separate plain requests session for large file downloads.
@@ -226,7 +238,7 @@ class TeraboxDownloader:
                 resp = self.sc.post(
                     f"{HNN_API_BASE}{endpoint}",
                     json=params,
-                    headers=HNN_HEADERS,
+                    headers={"Content-Type": "application/json"},
                     timeout=20,
                 )
                 if resp.status_code == 200:
@@ -253,15 +265,13 @@ class TeraboxDownloader:
         """
         Download a file from Terabox with retries and download-link regeneration.
 
-        Uses a plain requests session for streaming downloads to avoid
-        cloudscraper's memory buffering (which causes OOM on large files).
-        CDN download URLs don't need Cloudflare bypass.
-        Regenerates the download link on each retry because Terabox links
-        are short-lived and often single-use.
+        Primary: aria2c (handles CDN TCP resets, multiple connections, resume).
+        Fallback: plain requests streaming.
 
         Returns dict with filepath/filename/size_mb on success, None on failure.
         """
         import os
+        import shutil
 
         def _update(text):
             logger.info(text)
@@ -271,16 +281,10 @@ class TeraboxDownloader:
                 except Exception:
                     pass
 
-        dl_headers = {
-            "User-Agent": UA,
-            "Accept": "*/*",
-            "Accept-Encoding": "identity",
-            "Connection": "keep-alive",
-            "Referer": referer or f"https://www.terabox.app/",
-        }
+        aria2c_available = shutil.which("aria2c") is not None
 
         for attempt in range(1, max_retries + 1):
-            # (Re)generate download link on every attempt
+            # (Re)generate download link on every attempt — links are short-lived
             dl_url = self.get_download_link(fs_id)
             if not dl_url:
                 logger.warning(f"Terabox download attempt {attempt}/{max_retries}: "
@@ -289,90 +293,39 @@ class TeraboxDownloader:
                     time.sleep(2)
                 continue
 
-            try:
-                _update(f"⬇️ Downloading (attempt {attempt}/{max_retries})...")
-                logger.debug(f"Terabox download URL: {dl_url[:150]}")
+            _update(f"⬇️ Downloading (attempt {attempt}/{max_retries})...")
+            logger.debug(f"Terabox download URL: {dl_url[:150]}")
 
-                # Use plain requests session for file downloads to avoid
-                # cloudscraper buffering entire response in memory (OOM).
-                # CDN URLs (dm-d.1024tera.com etc.) don't need CF bypass.
-                resp = self.dl_session.get(
-                    dl_url,
-                    headers=dl_headers,
-                    stream=True,
-                    timeout=(15, 300),  # (connect, read) — large files need long read timeout
-                    allow_redirects=True,
-                )
-                logger.debug(
-                    f"Terabox download response: status={resp.status_code}, "
-                    f"content-type={resp.headers.get('content-type', '?')}, "
-                    f"content-length={resp.headers.get('content-length', '?')}"
-                )
-                resp.raise_for_status()
+            # Clean up any leftover partial file
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+            success = False
+            if aria2c_available:
+                success = self._download_with_aria2c(dl_url, output_path, referer)
+            if not success:
+                success = self._download_with_requests(dl_url, output_path, referer, _update)
+
+            if success and os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
 
                 # Reject HTML error pages
-                content_type = resp.headers.get("content-type", "").lower()
-                if "text/html" in content_type:
-                    resp.close()
-                    logger.warning(f"Terabox attempt {attempt}: got HTML instead of file")
-                    if attempt < max_retries:
-                        time.sleep(2)
-                    continue
-
-                total_bytes = int(resp.headers.get("content-length", 0))
-                bytes_written = 0
-
-                try:
-                    with open(output_path, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=1024 * 1024):  # 1 MB chunks
-                            if chunk:
-                                f.write(chunk)
-                                bytes_written += len(chunk)
-                                if total_bytes and bytes_written % (1024 * 1024 * 10) < 1024 * 1024:
-                                    pct = bytes_written / total_bytes * 100
-                                    _update(f"⬇️ Progress: {pct:.0f}% "
-                                            f"({bytes_written // 1024 // 1024} MB / "
-                                            f"{total_bytes // 1024 // 1024} MB)")
-                finally:
-                    resp.close()
-
-                # Validate downloaded file
-                if os.path.exists(output_path):
-                    file_size = os.path.getsize(output_path)
-
-                    # Check for HTML error pages disguised as files
-                    with open(output_path, "rb") as f:
-                        header = f.read(64)
-                    if b"<html" in header.lower() or b"<!doctype" in header.lower():
-                        logger.warning(f"Terabox attempt {attempt}: downloaded HTML, not file")
-                        os.remove(output_path)
-                        if attempt < max_retries:
-                            time.sleep(2)
-                        continue
-
-                    if file_size > 1024:  # at least 1 KB
-                        size_mb = file_size / (1024 * 1024)
-                        logger.info(f"Terabox: downloaded {size_mb:.2f} MB to {output_path}")
-                        return {
-                            "filepath": output_path,
-                            "filename": os.path.basename(output_path),
-                            "size_mb": round(size_mb, 2),
-                        }
-                    else:
-                        logger.warning(f"Terabox attempt {attempt}: file too small ({file_size} bytes)")
-                        os.remove(output_path)
-
-            except Exception as e:
-                logger.warning(
-                    f"Terabox download attempt {attempt}/{max_retries} failed: {e}",
-                    exc_info=(attempt == max_retries),
-                )
-                # Clean up partial file
-                if os.path.exists(output_path):
-                    try:
-                        os.remove(output_path)
-                    except OSError:
-                        pass
+                with open(output_path, "rb") as f:
+                    header = f.read(64)
+                if b"<html" in header.lower() or b"<!doctype" in header.lower():
+                    logger.warning(f"Terabox attempt {attempt}: downloaded HTML, not file")
+                    os.remove(output_path)
+                elif file_size > 1024:
+                    size_mb = file_size / (1024 * 1024)
+                    logger.info(f"Terabox: downloaded {size_mb:.2f} MB to {output_path}")
+                    return {
+                        "filepath": output_path,
+                        "filename": os.path.basename(output_path),
+                        "size_mb": round(size_mb, 2),
+                    }
+                else:
+                    logger.warning(f"Terabox attempt {attempt}: file too small ({file_size} bytes)")
+                    os.remove(output_path)
 
             if attempt < max_retries:
                 wait = attempt * 2
@@ -380,6 +333,120 @@ class TeraboxDownloader:
                 time.sleep(wait)
 
         return None
+
+    def _download_with_aria2c(self, url: str, output_path: str, referer: str = "") -> bool:
+        """
+        Download using aria2c — handles CDN TCP resets, supports multi-connection
+        and automatic resume. Returns True on success.
+        """
+        import os
+        import subprocess
+
+        out_dir = os.path.dirname(output_path)
+        out_file = os.path.basename(output_path)
+
+        cmd = [
+            "aria2c",
+            "--out", out_file,
+            "--dir", out_dir,
+            "--max-connection-per-server=4",  # 4 connections per server (Terabox allows it)
+            "--split=4",                       # split file into 4 parts
+            "--min-split-size=10M",
+            "--max-tries=3",
+            "--retry-wait=3",
+            "--connect-timeout=15",
+            "--timeout=60",
+            "--auto-file-renaming=false",
+            "--allow-overwrite=true",
+            "--quiet=true",
+            f"--user-agent={UA}",
+            f"--referer={referer or 'https://www.terabox.app/'}",
+            "--header=Accept: */*",
+            "--header=Accept-Encoding: identity",
+            url,
+        ]
+        logger.debug(f"aria2c: {' '.join(cmd[:8])}...")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode == 0 and os.path.exists(output_path):
+                logger.info(f"aria2c: success for {out_file}")
+                return True
+            logger.warning(f"aria2c failed (rc={result.returncode}): {result.stderr[:200]}")
+        except subprocess.TimeoutExpired:
+            logger.warning("aria2c: timed out after 600s")
+        except Exception as e:
+            logger.warning(f"aria2c error: {e}")
+        return False
+
+    def _download_with_requests(
+        self, url: str, output_path: str, referer: str = "", progress_fn=None
+    ) -> bool:
+        """
+        Download using plain requests streaming — fallback when aria2c unavailable.
+        Returns True on success.
+        """
+        import os
+
+        def _log(text):
+            logger.info(text)
+            if progress_fn:
+                try:
+                    progress_fn(text)
+                except Exception:
+                    pass
+
+        dl_headers = {
+            "User-Agent": UA,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive",
+            "Referer": referer or "https://www.terabox.app/",
+        }
+        try:
+            resp = self.dl_session.get(
+                url,
+                headers=dl_headers,
+                stream=True,
+                timeout=(15, 300),
+                allow_redirects=True,
+            )
+            logger.debug(
+                f"requests: status={resp.status_code}, "
+                f"content-length={resp.headers.get('content-length','?')}, "
+                f"content-type={resp.headers.get('content-type','?')}"
+            )
+            resp.raise_for_status()
+
+            content_type = resp.headers.get("content-type", "").lower()
+            if "text/html" in content_type:
+                resp.close()
+                logger.warning("requests: got HTML response")
+                return False
+
+            total_bytes = int(resp.headers.get("content-length", 0))
+            bytes_written = 0
+            try:
+                with open(output_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            bytes_written += len(chunk)
+                            if total_bytes and bytes_written % (1024 * 1024 * 10) < 1024 * 1024:
+                                pct = bytes_written / total_bytes * 100
+                                _log(f"⬇️ Progress: {pct:.0f}% "
+                                     f"({bytes_written // 1024 // 1024} MB / "
+                                     f"{total_bytes // 1024 // 1024} MB)")
+            finally:
+                resp.close()
+            return bytes_written > 0
+        except Exception as e:
+            logger.warning(f"requests download failed: {e}", exc_info=False)
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            return False
 
     def download_files(
         self,
@@ -464,41 +531,43 @@ class TeraboxDownloader:
     # ── HNN Workers Proxy Methods ────────────────────────────────────────
 
     def _hnn_get_info(self, surl: str) -> dict | None:
-        """Get file info from hnn workers proxy with retries."""
-        # Visit main page first to get CF cookies
-        try:
-            self.sc.get(HNN_API_BASE + "/", timeout=10)
-        except Exception as e:
-            logger.debug(f"Terabox: hnn main page: {e}")
+        """
+        Get file info from hnn workers proxy.
+        Tries /api/get-info-new first, falls back to /api/get-info (same as trauso).
+        """
+        endpoints = ["/api/get-info-new", "/api/get-info"]
 
-        api_url = f"{HNN_API_BASE}/api/get-info-new?shorturl={surl}&pwd="
+        for api_endpoint in endpoints:
+            api_url = f"{HNN_API_BASE}{api_endpoint}?shorturl={surl}&pwd="
+            for attempt in range(3):
+                try:
+                    resp = self.sc.get(api_url, timeout=15)
+                    if resp.status_code != 200:
+                        logger.debug(f"Terabox: hnn {api_endpoint} attempt {attempt + 1}: HTTP {resp.status_code}")
+                        time.sleep(1.5)
+                        continue
 
-        for attempt in range(3):
-            try:
-                resp = self.sc.get(api_url, headers=HNN_HEADERS, timeout=15)
-                if resp.status_code != 200:
-                    logger.debug(f"Terabox: hnn attempt {attempt + 1}: HTTP {resp.status_code}")
-                    time.sleep(1.5)
-                    continue
+                    data = resp.json()
+                    if data.get("ok") and data.get("sign"):
+                        logger.info(
+                            f"Terabox: hnn OK via {api_endpoint} "
+                            f"(shareid={data.get('shareid')}, "
+                            f"files={len(data.get('list', []))})"
+                        )
+                        return data
+                    else:
+                        logger.debug(
+                            f"Terabox: hnn {api_endpoint} attempt {attempt + 1}: "
+                            f"ok={data.get('ok')}, msg={data.get('message', '?')}"
+                        )
+                except Exception as e:
+                    logger.debug(f"Terabox: hnn {api_endpoint} attempt {attempt + 1}: {e}")
 
-                data = resp.json()
-                if data.get("ok") and data.get("sign"):
-                    logger.info(
-                        f"Terabox: hnn OK (shareid={data.get('shareid')}, "
-                        f"files={len(data.get('list', []))})"
-                    )
-                    return data
-                else:
-                    logger.debug(
-                        f"Terabox: hnn attempt {attempt + 1}: ok={data.get('ok')}, "
-                        f"msg={data.get('message', '?')}"
-                    )
-            except Exception as e:
-                logger.debug(f"Terabox: hnn attempt {attempt + 1}: {e}")
+                time.sleep(1.5)
 
-            time.sleep(1.5)
+            logger.debug(f"Terabox: {api_endpoint} failed after 3 attempts, trying next endpoint")
 
-        logger.warning("Terabox: hnn get-info-new failed after 3 attempts")
+        logger.warning("Terabox: all hnn info endpoints failed")
         return None
 
     def _hnn_list_dir(self, dir_path: str) -> list | None:
@@ -510,7 +579,7 @@ class TeraboxDownloader:
                 f"&dir={quote(dir_path)}"
                 f"&randsk={quote(self.randsk)}"
             )
-            resp = self.sc.get(url, headers=HNN_HEADERS, timeout=15)
+            resp = self.sc.get(url, timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("ok") and data.get("list"):

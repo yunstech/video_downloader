@@ -944,12 +944,13 @@ def download_video(
                 return result
             raise RuntimeError("Terabox download failed after all retries.")
 
-        # Multiple files: download concurrently (3 parallel)
+        # Multiple files: download sequentially — Terabox CDN drops concurrent
+        # connections from the same IP (IncompleteRead 0 bytes)
         downloaded = tb.download_files(
             files=targets,
             download_dir=download_dir,
             referer=url,
-            max_workers=3,
+            max_workers=1,
             progress_callback=_update,
         )
 

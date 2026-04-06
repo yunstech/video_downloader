@@ -1,9 +1,10 @@
 FROM python:3.11
 
-# Install system dependencies: ffmpeg, curl
+# Install system dependencies: ffmpeg, curl, aria2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
+    aria2 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
