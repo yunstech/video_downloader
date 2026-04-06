@@ -36,11 +36,11 @@ UA = (
 )
 
 # Headers that match what the hnn workers.dev proxy expects (Chrome 143 fingerprint)
-# Note: requests library doesn't support zstd — omit it from Accept-Encoding
+# Note: requests needs 'brotli' package for br — stick to gzip, deflate only
 HNN_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
@@ -534,51 +534,45 @@ class TeraboxDownloader:
     def _hnn_get_info(self, surl: str) -> dict | None:
         """
         Get file info from hnn workers proxy.
-        Tries /api/get-info-new first, falls back to /api/get-info (same as trauso).
         """
-        endpoints = ["/api/get-info-new", "/api/get-info"]
+        api_url = f"{HNN_API_BASE}/api/get-info-new?shorturl={surl}&pwd="
+        for attempt in range(3):
+            try:
+                resp = self.sc.get(api_url, timeout=15)
+                if resp.status_code != 200:
+                    logger.warning(f"Terabox: hnn get-info-new attempt {attempt + 1}: HTTP {resp.status_code}")
+                    time.sleep(1.5)
+                    continue
 
-        for api_endpoint in endpoints:
-            api_url = f"{HNN_API_BASE}{api_endpoint}?shorturl={surl}&pwd="
-            for attempt in range(3):
+                # Log raw response snippet for diagnosis
+                raw = resp.text
+                logger.debug(f"Terabox: hnn get-info-new response (first 200): {raw[:200]}")
+
                 try:
-                    resp = self.sc.get(api_url, timeout=15)
-                    if resp.status_code != 200:
-                        logger.warning(f"Terabox: hnn {api_endpoint} attempt {attempt + 1}: HTTP {resp.status_code}")
-                        time.sleep(1.5)
-                        continue
+                    data = resp.json()
+                except Exception as je:
+                    logger.warning(f"Terabox: hnn get-info-new attempt {attempt + 1}: JSON parse failed: {je}; raw={raw[:100]}")
+                    time.sleep(1.5)
+                    continue
 
-                    # Log raw response snippet for diagnosis
-                    raw = resp.text
-                    logger.debug(f"Terabox: hnn {api_endpoint} response (first 200): {raw[:200]}")
+                if data.get("ok") and data.get("sign"):
+                    logger.info(
+                        f"Terabox: hnn OK "
+                        f"(shareid={data.get('shareid')}, "
+                        f"files={len(data.get('list', []))})"
+                    )
+                    return data
+                else:
+                    logger.warning(
+                        f"Terabox: hnn get-info-new attempt {attempt + 1}: "
+                        f"ok={data.get('ok')}, msg={data.get('message', '?')}"
+                    )
+            except Exception as e:
+                logger.warning(f"Terabox: hnn get-info-new attempt {attempt + 1}: {e}")
 
-                    try:
-                        data = resp.json()
-                    except Exception as je:
-                        logger.warning(f"Terabox: hnn {api_endpoint} attempt {attempt + 1}: JSON parse failed: {je}; raw={raw[:100]}")
-                        time.sleep(1.5)
-                        continue
+            time.sleep(1.5)
 
-                    if data.get("ok") and data.get("sign"):
-                        logger.info(
-                            f"Terabox: hnn OK via {api_endpoint} "
-                            f"(shareid={data.get('shareid')}, "
-                            f"files={len(data.get('list', []))})"
-                        )
-                        return data
-                    else:
-                        logger.warning(
-                            f"Terabox: hnn {api_endpoint} attempt {attempt + 1}: "
-                            f"ok={data.get('ok')}, msg={data.get('message', '?')}"
-                        )
-                except Exception as e:
-                    logger.warning(f"Terabox: hnn {api_endpoint} attempt {attempt + 1}: {e}")
-
-                time.sleep(1.5)
-
-            logger.warning(f"Terabox: {api_endpoint} failed after 3 attempts, trying next endpoint")
-
-        logger.warning("Terabox: all hnn info endpoints failed")
+        logger.warning("Terabox: all hnn info attempts failed")
         return None
 
     def _hnn_list_dir(self, dir_path: str) -> list | None:
