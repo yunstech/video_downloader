@@ -108,10 +108,76 @@ AD_URL_PATTERNS = (
 logger = logging.getLogger(__name__)
 
 
+def _probe_video_stream(filepath: str) -> tuple:
+    """
+    Use ffprobe to check that the file contains a real, playable video stream.
+    Returns (is_ok: bool, reason: str).
+    Skips silently if ffprobe is not available.
+    """
+    import subprocess
+    import json
+    import shutil
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return True, ""
+
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", filepath],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return True, ""
+
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        fmt = data.get("format", {})
+
+        video_streams = [s for s in streams if s.get("codec_type") == "video"]
+        if not video_streams:
+            return False, "No video stream found in file"
+
+        vs = video_streams[0]
+        codec = vs.get("codec_name", "")
+        width = int(vs.get("width") or 0)
+        height = int(vs.get("height") or 0)
+        duration = float(vs.get("duration") or fmt.get("duration") or 0)
+
+        # Image codecs wrapped in a video container = ad tracking pixel
+        image_codecs = {"png", "bmp", "gif", "mjpeg", "tiff", "webp"}
+        if codec in image_codecs:
+            return False, (
+                f"Video stream uses image codec '{codec}' — "
+                "this is an ad placeholder, not the real video"
+            )
+
+        # 1×1 or tiny dimensions = ad tracking pixel
+        if 0 < width < 64 or 0 < height < 64:
+            return False, (
+                f"Video dimensions {width}×{height} are too small — "
+                "this is an ad placeholder, not the real video"
+            )
+
+        # Near-zero duration with large file = corrupt/wrong stream
+        if 0 < duration < 2.0:
+            return False, (
+                f"Video duration is only {duration:.2f}s — "
+                "this is an ad placeholder or corrupt stream, not the real video"
+            )
+
+        return True, ""
+
+    except Exception as e:
+        logger.debug(f"ffprobe probe failed (non-fatal): {e}")
+        return True, ""
+
+
 def _validate_downloaded_file(filepath: str) -> dict:
     """
     Validate a downloaded file and return result dict.
-    Raises RuntimeError if the file is missing, empty, or too small.
+    Raises RuntimeError if the file is missing, empty, too small, or not a real video.
     """
     if not os.path.exists(filepath):
         raise RuntimeError("Download completed but output file not found.")
@@ -149,6 +215,16 @@ def _validate_downloaded_file(filepath: str) -> dict:
             f"Downloaded file is too small ({file_size} bytes). "
             "This is likely an error response, not a video. "
             "Try sending the original page URL."
+        )
+
+    # Deep validation: check codec/dimensions/duration via ffprobe
+    ok, reason = _probe_video_stream(filepath)
+    if not ok:
+        logger.warning(f"ffprobe rejected {filepath}: {reason}")
+        os.remove(filepath)
+        raise RuntimeError(
+            f"Downloaded file is not a playable video ({reason}). "
+            "The scraper picked up a wrong URL — try sending the original page URL."
         )
 
     logger.info(f"Validated download: {filepath} ({size_mb:.2f} MB)")
@@ -653,6 +729,13 @@ def _download_direct_with_headers(
                 header = f.read(64)
             if b"<html" in header.lower() or b"<!doctype" in header.lower():
                 logger.warning("Downloaded file is HTML, not video — removing")
+                os.remove(output_path)
+                return None
+
+            # Deep check: reject ad placeholders (1×1 pixel, image codec, near-zero duration)
+            ok, reason = _probe_video_stream(output_path)
+            if not ok:
+                logger.warning(f"ffprobe rejected direct download ({reason}), removing")
                 os.remove(output_path)
                 return None
 
@@ -1337,81 +1420,100 @@ def download_video(
 
     downloadable.sort(key=_url_priority)
 
-    _, chosen_url = downloadable[0]
-    logger.info(f"Selected URL: {chosen_url[:100]}...")
-
-    # ── Step 4: Generate unique filename ─────────────────────────────────
-    unique_prefix = uuid.uuid4().hex[:8]
-    filename = f"{unique_prefix}_{generate_filename(chosen_url)}"
-    output_path = os.path.join(download_dir, filename)
-
-    # ── Step 5: Download ─────────────────────────────────────────────────
-    _update(f"⬇️ Downloading video...")
-
-    # Determine the right referer for the download
-    download_referer = url  # use the page URL as referer
-    cdn_referer = _get_cdn_referer(
-        urlparse(chosen_url).netloc.lower()
-    )
-    if cdn_referer:
-        download_referer = cdn_referer
-
-    if ".m3u8" in chosen_url.lower():
-        if not output_path.lower().endswith((".mp4", ".ts")):
-            output_path = os.path.splitext(output_path)[0] + ".mp4"
-
-        # Try ffmpeg first (most reliable for HLS — downloads ALL segments)
-        success = _download_m3u8_ffmpeg(
-            chosen_url, output_path, referer=download_referer,
-            progress_callback=_update
+    # ── Steps 4-5: Try each candidate URL in priority order ──────────────
+    # If a URL passes download but fails ffprobe validation (e.g. 1×1 ad pixel,
+    # image codec, near-zero duration), move on to the next candidate.
+    for attempt_index, (_, chosen_url) in enumerate(downloadable):
+        logger.info(
+            f"Trying URL {attempt_index + 1}/{len(downloadable)}: {chosen_url[:100]}..."
         )
 
-        # Fallback to native downloader if ffmpeg unavailable or failed
-        if not success:
-            logger.info("ffmpeg HLS failed, trying native m3u8 downloader")
-            if session is None:
-                import requests as req
-                session = req.Session()
-            session.headers.update({
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Referer": download_referer,
-            })
-            success = download_m3u8_native(
-                chosen_url, output_path, url, session, workers=workers
-            )
-    else:
-        # Try our improved direct downloader first
-        result = _download_direct_with_headers(
-            chosen_url, output_path, referer=download_referer,
-            progress_callback=_update
-        )
-        if result:
-            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
-            return result
+        unique_prefix = uuid.uuid4().hex[:8]
+        filename = f"{unique_prefix}_{generate_filename(chosen_url)}"
+        output_path = os.path.join(download_dir, filename)
 
-        # Fallback to original download_direct
-        download_direct(chosen_url, output_path, url, session)
-        success = True
+        _update(f"⬇️ Downloading video...")
 
-    if not success or not os.path.exists(output_path):
-        ts_path = os.path.splitext(output_path)[0] + ".ts"
-        if os.path.exists(ts_path):
-            output_path = ts_path
-        else:
-            # Last resort: try yt-dlp (with ad filtering)
-            _update("⚠️ Scraper download failed, trying yt-dlp as last resort...")
-            ytdlp_path = os.path.join(download_dir, f"{uuid.uuid4().hex[:8]}_video.mp4")
-            result = _try_ytdlp(url, ytdlp_path, progress_callback=_update)
-            if result:
+        # Determine the right referer for the download
+        download_referer = url  # use the page URL as referer
+        cdn_referer = _get_cdn_referer(urlparse(chosen_url).netloc.lower())
+        if cdn_referer:
+            download_referer = cdn_referer
+
+        try:
+            if ".m3u8" in chosen_url.lower():
+                if not output_path.lower().endswith((".mp4", ".ts")):
+                    output_path = os.path.splitext(output_path)[0] + ".mp4"
+
+                # Try ffmpeg first (most reliable for HLS)
+                success = _download_m3u8_ffmpeg(
+                    chosen_url, output_path, referer=download_referer,
+                    progress_callback=_update
+                )
+
+                # Fallback to native downloader if ffmpeg unavailable or failed
+                if not success:
+                    logger.info("ffmpeg HLS failed, trying native m3u8 downloader")
+                    if session is None:
+                        import requests as req
+                        session = req.Session()
+                    session.headers.update({
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                        "Referer": download_referer,
+                    })
+                    success = download_m3u8_native(
+                        chosen_url, output_path, url, session, workers=workers
+                    )
+
+                # Check .ts fallback path
+                if not success or not os.path.exists(output_path):
+                    ts_path = os.path.splitext(output_path)[0] + ".ts"
+                    if os.path.exists(ts_path):
+                        output_path = ts_path
+                    else:
+                        logger.warning(f"URL {attempt_index + 1}: HLS download produced no file, trying next")
+                        continue
+
+                result = _validate_downloaded_file(output_path)
                 _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
                 return result
-            raise RuntimeError("Download completed but output file not found.")
 
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    _update(f"✅ Download complete! ({size_mb:.1f} MB)")
+            else:
+                # Try direct download with proper headers
+                result = _download_direct_with_headers(
+                    chosen_url, output_path, referer=download_referer,
+                    progress_callback=_update
+                )
+                if result:
+                    _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                    return result
 
-    return _validate_downloaded_file(output_path)
+                # Fallback to original download_direct
+                download_direct(chosen_url, output_path, url, session)
+                if not os.path.exists(output_path):
+                    logger.warning(f"URL {attempt_index + 1}: no output file, trying next")
+                    continue
+
+                result = _validate_downloaded_file(output_path)
+                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                return result
+
+        except RuntimeError as e:
+            logger.warning(f"URL {attempt_index + 1} rejected: {e}")
+            continue
+        except Exception as e:
+            logger.warning(f"URL {attempt_index + 1} failed with exception: {e}")
+            continue
+
+    # All scraped URLs failed — last resort: yt-dlp
+    _update("⚠️ All scraped URLs failed, trying yt-dlp as last resort...")
+    ytdlp_path = os.path.join(download_dir, f"{uuid.uuid4().hex[:8]}_video.mp4")
+    result = _try_ytdlp(url, ytdlp_path, progress_callback=_update)
+    if result:
+        _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+        return result
+    raise RuntimeError("No working video URL found on the page. Try sending a direct video URL.")
