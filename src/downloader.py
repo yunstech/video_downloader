@@ -53,6 +53,7 @@ ADULT_PAGE_DOMAINS = (
     "xnxx.com",
     "tube8.com",
     "beeg.com",
+    "pornavhd.com",
 )
 
 # CDN domains for adult sites — direct video URLs that need proper headers
@@ -474,7 +475,16 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
 
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "best[ext=mp4]/best",
+        # Prefer H.264+AAC in MP4 for Telegram compatibility.
+        # Telegram's inline player only supports H.264 video; H.265/VP9/AV1 cause
+        # "cannot be played" even if the file downloads successfully.
+        "format": (
+            "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[vcodec^=avc]+bestaudio"
+            "/best[vcodec^=avc][ext=mp4]"
+            "/best[ext=mp4]"
+            "/best"
+        ),
         "merge_output_format": "mp4",
         "quiet": False,
         "no_warnings": False,
