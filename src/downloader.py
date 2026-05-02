@@ -1388,9 +1388,12 @@ def download_video(
         u_lower = u.lower()
         # m3u8 playlists — best (gives us ALL segments)
         if ".m3u8" in u_lower:
-            # Deprioritize m3u8 from known ad-wrapping/injecting CDNs
-            if any(ad in u_lower for ad in ("tiktokcdn.com", "playrecord.biz")):
-                return (0, 2)  # ad-gated m3u8
+            # Deprioritize m3u8 from known ad-injecting CDNs
+            if any(ad in u_lower for ad in ("tiktokcdn.com",)):
+                return (0, 3)  # ad m3u8
+            # Deprioritize sidebar/related video CDNs
+            if "growcdnssedge.com" in u_lower:
+                return (0, 2)  # sidebar video CDN
             return (0, 0)
         # Individual .ts segments — worst (only a few seconds)
         if u_lower.split("?")[0].endswith(".ts"):
@@ -1415,6 +1418,19 @@ def download_video(
     # Collect all m3u8 URLs for fallback attempts
     m3u8_candidates = [(src, u) for src, u in downloadable if ".m3u8" in u.lower()]
     non_m3u8_candidates = [(src, u) for src, u in downloadable if ".m3u8" not in u.lower()]
+
+    # If we have a playrecord.biz m3u8 (main video), exclude growcdnssedge.com
+    # m3u8 URLs which are always sidebar/related (wrong) videos
+    has_playrecord = any("playrecord.biz" in u for _, u in m3u8_candidates)
+    if has_playrecord:
+        _filtered = [(s, u) for s, u in m3u8_candidates if "growcdnssedge.com" not in u]
+        if _filtered:
+            if len(_filtered) < len(m3u8_candidates):
+                logger.info(
+                    f"Filtered {len(m3u8_candidates) - len(_filtered)} growcdnssedge.com "
+                    f"m3u8 URLs (sidebar videos) — keeping {len(_filtered)} playrecord.biz URLs"
+                )
+            m3u8_candidates = _filtered
 
     _, chosen_url = downloadable[0]
     logger.info(f"Selected URL: {chosen_url[:100]}...")
@@ -1446,19 +1462,24 @@ def download_video(
                 _update(f"⬇️ Trying alternate stream ({m3u8_idx + 1}/{len(m3u8_candidates)})...")
                 logger.info(f"Trying m3u8 candidate [{m3u8_idx}]: {m3u8_url[:100]}")
 
-            # Determine referer for this specific URL
+            # Build list of referers to try for this m3u8
             _cdn_ref = _get_cdn_referer(urlparse(m3u8_url).netloc.lower())
+            _m3u8_origin = f"{urlparse(m3u8_url).scheme}://{urlparse(m3u8_url).netloc}/"
+            # Try: CDN-mapped referer, page URL, m3u8 origin, no referer
             _referer = _cdn_ref if _cdn_ref else url
 
-            # Try ffmpeg first
-            success = _download_m3u8_ffmpeg(
-                m3u8_url, output_path, referer=_referer,
-                progress_callback=_update, cookies=playwright_cookies
-            )
+            # Try ffmpeg with: page referer, m3u8 origin, then NO referer (IDM-style)
+            for ff_referer in [_referer, _m3u8_origin, ""]:
+                success = _download_m3u8_ffmpeg(
+                    m3u8_url, output_path, referer=ff_referer,
+                    progress_callback=_update, cookies=playwright_cookies
+                )
+                if success:
+                    break
             if success:
                 break
 
-            # Fallback to native downloader
+            # Fallback to native downloader (tries multiple referers internally)
             logger.info("ffmpeg HLS failed, trying native m3u8 downloader")
             if session is None:
                 import requests as req

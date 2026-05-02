@@ -176,6 +176,7 @@ def fetch_with_playwright(url):
         context = browser.new_context(
             user_agent=COMMON_HEADERS["User-Agent"],
             viewport={"width": 1920, "height": 1080},
+            ignore_https_errors=True,
         )
         page = context.new_page()
         video_network_urls = []
@@ -412,6 +413,9 @@ def fetch_with_playwright(url):
 
             # Extract cookies from the browser context for use in downloads
             cookies = context.cookies()
+            # Log cookie domains for debugging
+            cookie_domains = set(c.get("domain", "") for c in cookies)
+            print(f"  🍪 Captured {len(cookies)} cookies from domains: {sorted(cookie_domains)}")
             browser.close()
             return html, video_network_urls, cookies
         except Exception as e:
@@ -734,6 +738,15 @@ class HLSDecryptor:
 def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8):
     """Download HLS stream: fetch segments, decrypt if needed, merge."""
 
+    # Determine the best referer for segment requests.
+    # Some CDNs validate referer per-segment. Common patterns:
+    # 1. Page URL (what we receive)
+    # 2. The m3u8 URL origin (what browser HLS players typically send)
+    # 3. No referer at all (some CDNs reject foreign referers)
+    from urllib.parse import urlparse as _urlparse
+    _m3u8_parsed = _urlparse(m3u8_url)
+    segment_referer = f"{_m3u8_parsed.scheme}://{_m3u8_parsed.netloc}/"
+
     # Step 1: Fetch the m3u8 playlist
     print(f"\n📋 Fetching playlist: {m3u8_url[:80]}...")
     resp = http_get(m3u8_url, referer=referer, session=session)
@@ -812,10 +825,14 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8
         def download_and_decrypt(seg):
             seg_path = os.path.join(tmp_dir, f"segment_{seg.index:05d}.ts")
             max_retries = 3
+            # Try different referers: m3u8 origin, page URL, no referer
+            referers_to_try = [segment_referer, referer, None]
 
             for attempt in range(max_retries):
+                # Cycle through referers on retries
+                attempt_referer = referers_to_try[attempt % len(referers_to_try)]
                 try:
-                    r = http_get(seg.url, referer=referer, session=session)
+                    r = http_get(seg.url, referer=attempt_referer, session=session)
                     r.raise_for_status()
                     data = r.content
 
