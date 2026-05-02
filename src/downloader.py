@@ -719,6 +719,8 @@ def _download_m3u8_ffmpeg(
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
+        # Fix timestamp issues common in HLS streams
+        "-fflags", "+genpts+igndts",
     ]
 
     # Add headers
@@ -738,6 +740,7 @@ def _download_m3u8_ffmpeg(
         "-bsf:a", "aac_adtstoasc",  # fix AAC stream for mp4 container
         "-movflags", "+faststart",   # enable streaming-friendly mp4
         "-max_muxing_queue_size", "1024",  # prevent queue overflow on long videos
+        "-ignore_unknown",
         "-loglevel", "warning",
         output_path,
     ])

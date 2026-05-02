@@ -871,11 +871,13 @@ def _merge_with_ffmpeg(segment_files, output_path, tmp_dir):
 
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-fflags", "+genpts+igndts",  # Regenerate PTS, ignore DTS errors
         "-f", "concat", "-safe", "0",
         "-i", concat_path,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         "-movflags", "+faststart",
+        "-ignore_unknown",
         output_path,
     ]
 
@@ -884,9 +886,27 @@ def _merge_with_ffmpeg(segment_files, output_path, tmp_dir):
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {output_path}")
         return True
-    else:
-        print(f"  ⚠️  ffmpeg muxing error: {result.stderr[:200]}")
-        print(f"  Falling back to direct merge...")
+
+    # aac_adtstoasc may fail if audio isn't AAC — retry without it
+    print(f"  ⚠️  ffmpeg muxing failed, retrying without aac filter...")
+    cmd2 = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-fflags", "+genpts+igndts",
+        "-f", "concat", "-safe", "0",
+        "-i", concat_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-ignore_unknown",
+        output_path,
+    ]
+    result2 = subprocess.run(cmd2, capture_output=True, text=True)
+    if result2.returncode == 0:
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {output_path}")
+        return True
+
+    print(f"  ⚠️  ffmpeg muxing error: {result2.stderr[:200]}")
+    print(f"  Falling back to direct merge...")
         return _merge_direct(segment_files, output_path)
 
 
