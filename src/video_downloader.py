@@ -534,11 +534,13 @@ class HLSSegment:
 def parse_m3u8_playlist(content, base_url):
     """
     Parse m3u8 playlist, extracting segments with encryption info.
-    Returns (segments, is_master_playlist).
+    Returns (segments, is_master_playlist, init_segment_url).
+    init_segment_url is set when #EXT-X-MAP is present (fMP4/CMAF HLS).
     """
     lines = content.strip().splitlines()
     segments = []
     is_master = False
+    init_segment_url = None
 
     current_key_method = None
     current_key_url = None
@@ -551,6 +553,13 @@ def parse_m3u8_playlist(content, base_url):
         # Master playlist indicator
         if line.startswith("#EXT-X-STREAM-INF"):
             is_master = True
+
+        # Initialization segment (fMP4/CMAF HLS)
+        elif line.startswith("#EXT-X-MAP"):
+            map_attrs = _parse_m3u8_attributes(line)
+            uri = map_attrs.get("URI", "")
+            if uri:
+                init_segment_url = _resolve(uri, base_url)
 
         # Encryption key
         elif line.startswith("#EXT-X-KEY"):
@@ -583,7 +592,7 @@ def parse_m3u8_playlist(content, base_url):
             segments.append(seg)
             seg_index += 1
 
-    return segments, is_master
+    return segments, is_master, init_segment_url
 
 
 def _parse_m3u8_attributes(line):
@@ -724,7 +733,7 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8
     resp.raise_for_status()
     playlist_content = resp.text
 
-    segments, is_master = parse_m3u8_playlist(playlist_content, m3u8_url)
+    segments, is_master, init_segment_url = parse_m3u8_playlist(playlist_content, m3u8_url)
 
     # If master playlist, select best quality and re-fetch
     if is_master:
@@ -732,7 +741,7 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8
         resp = http_get(actual_m3u8, referer=referer, session=session)
         resp.raise_for_status()
         playlist_content = resp.text
-        segments, _ = parse_m3u8_playlist(playlist_content, actual_m3u8)
+        segments, _, init_segment_url = parse_m3u8_playlist(playlist_content, actual_m3u8)
 
     # Filter to actual media segments (not nested playlists)
     segments = [s for s in segments if not s.url.endswith(".m3u8")]
@@ -775,6 +784,21 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8
     tmp_dir = tempfile.mkdtemp(prefix="hls_download_")
 
     try:
+        # Download init segment if present (fMP4/CMAF HLS)
+        init_segment_path = None
+        if init_segment_url:
+            print(f"  📥 Downloading init segment (fMP4 stream)...")
+            init_segment_path = os.path.join(tmp_dir, "init_segment.mp4")
+            try:
+                r = http_get(init_segment_url, referer=referer, session=session)
+                r.raise_for_status()
+                with open(init_segment_path, "wb") as f:
+                    f.write(r.content)
+                print(f"     ✅ Init segment: {len(r.content)} bytes")
+            except Exception as e:
+                print(f"     ⚠️  Failed to fetch init segment: {e}")
+                init_segment_path = None
+
         segment_files = [None] * len(segments)
         failed = []
 
@@ -837,9 +861,9 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8
         print(f"\n  🔗 Merging segments...")
 
         if _has_ffmpeg():
-            return _merge_with_ffmpeg(valid_segments, output_path, tmp_dir)
+            return _merge_with_ffmpeg(valid_segments, output_path, tmp_dir, init_segment_path)
         else:
-            return _merge_direct(valid_segments, output_path)
+            return _merge_direct(valid_segments, output_path, init_segment_path)
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -853,50 +877,91 @@ def _has_ffmpeg():
         return False
 
 
-def _merge_with_ffmpeg(segment_files, output_path, tmp_dir):
+def _merge_with_ffmpeg(segment_files, output_path, tmp_dir, init_segment_path=None):
     """Merge with ffmpeg → proper .mp4."""
     if not output_path.lower().endswith(".mp4"):
         output_path = os.path.splitext(output_path)[0] + ".mp4"
 
     print(f"  🎬 Muxing to MP4 with ffmpeg...")
 
-    # Step 1: Binary-concatenate all TS segments into one .ts file.
-    # MPEG-TS is designed for byte-level concatenation — this preserves codec
-    # info that ffmpeg's "concat" demuxer can misidentify (e.g. treating H.264 as PNG).
-    combined_ts = os.path.join(tmp_dir, "combined.ts")
-    with open(combined_ts, "wb") as outf:
-        for seg in segment_files:
-            with open(seg, "rb") as inf:
-                shutil.copyfileobj(inf, outf)
+    # Detect if this is fMP4 (has init segment) or MPEG-TS
+    is_fmp4 = init_segment_path is not None and os.path.exists(init_segment_path)
 
-    # Step 2: Remux the single .ts to .mp4
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-        "-fflags", "+genpts+igndts",
-        "-i", combined_ts,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+faststart",
-        "-ignore_unknown",
-        output_path,
-    ]
+    # Auto-detect format from first segment if no init segment was declared
+    if not is_fmp4 and segment_files:
+        with open(segment_files[0], "rb") as f:
+            header = f.read(8)
+        # MPEG-TS starts with sync byte 0x47; fMP4 starts with a box size + 'ftyp'/'styp'/'moof'
+        if len(header) >= 4 and header[0:1] != b'\x47':
+            # Check for ISO BMFF box types (ftyp, styp, moof, free, skip)
+            box_type = header[4:8]
+            if box_type in (b'ftyp', b'styp', b'moof', b'free', b'skip'):
+                print(f"  📦 Auto-detected fMP4 segments (box type: {box_type.decode('ascii', errors='replace')})")
+                is_fmp4 = True
+
+    if is_fmp4:
+        # fMP4/CMAF: Prepend init segment then concatenate fragments
+        print(f"  📦 Detected fMP4/CMAF stream (init segment present)")
+        combined_file = os.path.join(tmp_dir, "combined.mp4")
+        with open(combined_file, "wb") as outf:
+            # Write init segment first (contains moov/codec headers)
+            with open(init_segment_path, "rb") as inf:
+                shutil.copyfileobj(inf, outf)
+            # Append all media segments (moof+mdat fragments)
+            for seg in segment_files:
+                with open(seg, "rb") as inf:
+                    shutil.copyfileobj(inf, outf)
+
+        # Remux fMP4 to proper MP4 with faststart
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+genpts+igndts",
+            "-i", combined_file,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            "-ignore_unknown",
+            output_path,
+        ]
+    else:
+        # MPEG-TS: Binary-concatenate all TS segments into one .ts file.
+        # MPEG-TS is designed for byte-level concatenation — this preserves codec
+        # info that ffmpeg's "concat" demuxer can misidentify.
+        combined_file = os.path.join(tmp_dir, "combined.ts")
+        with open(combined_file, "wb") as outf:
+            for seg in segment_files:
+                with open(seg, "rb") as inf:
+                    shutil.copyfileobj(inf, outf)
+
+        # Remux the single .ts to .mp4
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+genpts+igndts",
+            "-i", combined_file,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            "-movflags", "+faststart",
+            "-ignore_unknown",
+            output_path,
+        ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {output_path}")
         try:
-            os.remove(combined_ts)
+            os.remove(combined_file)
         except OSError:
             pass
         return True
 
-    # Retry without aac_adtstoasc (audio may not be AAC)
-    print(f"  ⚠️  ffmpeg muxing failed, retrying without aac filter...")
+    # Retry without aac filter / with different input format
+    print(f"  ⚠️  ffmpeg muxing failed (rc={result.returncode}), retrying...")
+    if result.stderr:
+        print(f"     {result.stderr[:200]}")
     cmd2 = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
         "-fflags", "+genpts+igndts",
-        "-i", combined_ts,
+        "-i", combined_file,
         "-c", "copy",
         "-movflags", "+faststart",
         "-ignore_unknown",
@@ -907,7 +972,7 @@ def _merge_with_ffmpeg(segment_files, output_path, tmp_dir):
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {output_path}")
         try:
-            os.remove(combined_ts)
+            os.remove(combined_file)
         except OSError:
             pass
         return True
@@ -915,27 +980,33 @@ def _merge_with_ffmpeg(segment_files, output_path, tmp_dir):
     print(f"  ⚠️  ffmpeg muxing error: {result2.stderr[:200]}")
     print(f"  Falling back to direct merge...")
     try:
-        os.remove(combined_ts)
+        os.remove(combined_file)
     except OSError:
         pass
-        return _merge_direct(segment_files, output_path)
+    return _merge_direct(segment_files, output_path, init_segment_path)
 
 
-def _merge_direct(segment_files, output_path):
+def _merge_direct(segment_files, output_path, init_segment_path=None):
     """Merge by binary concatenation → .ts file (playable in VLC/mpv)."""
-    ts_path = os.path.splitext(output_path)[0] + ".ts"
+    is_fmp4 = init_segment_path is not None and os.path.exists(init_segment_path)
+    ext = ".mp4" if is_fmp4 else ".ts"
+    out_path = os.path.splitext(output_path)[0] + ext
 
-    with open(ts_path, "wb") as outf:
+    with open(out_path, "wb") as outf:
+        if is_fmp4:
+            with open(init_segment_path, "rb") as inf:
+                shutil.copyfileobj(inf, outf)
         for seg_path in tqdm(segment_files, desc="  Merging", unit="seg"):
             with open(seg_path, "rb") as inf:
                 shutil.copyfileobj(inf, outf)
 
-    size_mb = os.path.getsize(ts_path) / (1024 * 1024)
-    print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {ts_path}")
-    print(f"\n  ▶️  Play with: vlc \"{ts_path}\"")
-    print(f"                mpv \"{ts_path}\"")
-    print(f"\n  💡 To convert to .mp4, install ffmpeg:")
-    print(f'     ffmpeg -i "{ts_path}" -c copy "{output_path}"')
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {out_path}")
+    print(f"\n  ▶️  Play with: vlc \"{out_path}\"")
+    print(f"                mpv \"{out_path}\"")
+    if not is_fmp4:
+        print(f"\n  💡 To convert to .mp4, install ffmpeg:")
+        print(f'     ffmpeg -i "{out_path}" -c copy "{output_path}"')
     return True
 
 
