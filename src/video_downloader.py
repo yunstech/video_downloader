@@ -812,6 +812,19 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8
                     r.raise_for_status()
                     data = r.content
 
+                    # Validate segment data — reject non-video responses
+                    if len(data) < 8:
+                        raise ValueError("Segment too small (< 8 bytes)")
+                    # PNG image (anti-hotlink placeholder)
+                    if data[:4] == b'\x89PNG':
+                        raise ValueError("CDN returned PNG image instead of video (token expired or bad referer)")
+                    # HTML error page
+                    if data[:5] in (b'<!DOC', b'<html', b'<HTML'):
+                        raise ValueError("CDN returned HTML error page")
+                    # GIF image
+                    if data[:4] == b'GIF8':
+                        raise ValueError("CDN returned GIF image instead of video")
+
                     # Decrypt if needed
                     data = decryptor.decrypt_segment(data, seg)
 
@@ -847,6 +860,16 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8
                 print(f"      Segment {idx}: {err}")
             if len(failed) > 5:
                 print(f"      ... and {len(failed) - 5} more")
+
+            # If ALL or most segments failed with the same error, it's likely
+            # a token/referer issue — don't produce a corrupt file
+            if len(failed) > len(segments) * 0.5:
+                first_errors = [err for _, err in failed[:3]]
+                is_cdn_error = any("PNG" in e or "HTML" in e or "token" in e for e in first_errors)
+                if is_cdn_error:
+                    print("\n  ❌ CDN is rejecting segment requests (token expired or wrong referer).")
+                    print("     The stream URL has likely expired. Please try again with a fresh page URL.")
+                    return False
 
         # Step 4: Merge segments
         valid_segments = [f for f in segment_files if f is not None]
@@ -900,13 +923,18 @@ def _merge_with_ffmpeg(segment_files, output_path, tmp_dir, init_segment_path=No
                 is_fmp4 = True
 
     if is_fmp4:
-        # fMP4/CMAF: Prepend init segment then concatenate fragments
-        print(f"  📦 Detected fMP4/CMAF stream (init segment present)")
+        # fMP4/CMAF: Prepend init segment (if available) then concatenate fragments
+        has_init = init_segment_path is not None and os.path.exists(init_segment_path)
+        if has_init:
+            print(f"  📦 fMP4/CMAF stream with init segment")
+        else:
+            print(f"  📦 fMP4/CMAF stream (no init segment — segments may be self-initializing)")
         combined_file = os.path.join(tmp_dir, "combined.mp4")
         with open(combined_file, "wb") as outf:
             # Write init segment first (contains moov/codec headers)
-            with open(init_segment_path, "rb") as inf:
-                shutil.copyfileobj(inf, outf)
+            if has_init:
+                with open(init_segment_path, "rb") as inf:
+                    shutil.copyfileobj(inf, outf)
             # Append all media segments (moof+mdat fragments)
             for seg in segment_files:
                 with open(seg, "rb") as inf:
