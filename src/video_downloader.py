@@ -238,9 +238,35 @@ def fetch_with_playwright(url):
         try:
             # Use domcontentloaded instead of networkidle — many sites never stop loading
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                # Wait a bit for JS to execute and video elements to appear
-                time.sleep(3)
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                # Wait a bit for JS to execute
+                time.sleep(2)
+
+                # Detect and wait for Cloudflare challenge to resolve
+                # CF challenges serve a page with specific markers that disappear
+                # once the challenge is solved and the real page loads
+                cf_waited = 0
+                while cf_waited < 20:
+                    title = page.title().lower()
+                    body_text = page.evaluate("() => document.body ? document.body.innerText.slice(0, 200) : ''")
+                    is_cf_challenge = (
+                        "just a moment" in title
+                        or "attention required" in title
+                        or "checking your browser" in body_text.lower()
+                        or "verify you are human" in body_text.lower()
+                        or "_cf_chl_opt" in page.content()[:3000]
+                    )
+                    if not is_cf_challenge:
+                        break
+                    print(f"    ⏳ Cloudflare challenge detected, waiting... ({cf_waited}s)")
+                    time.sleep(3)
+                    cf_waited += 3
+
+                if cf_waited > 0 and cf_waited < 20:
+                    print(f"    ✅ Cloudflare challenge passed ({cf_waited}s)")
+                    # After CF resolves, wait for the real page to settle
+                    time.sleep(3)
+
                 # Then try to wait for network to settle (but don't fail if it doesn't)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
@@ -276,6 +302,7 @@ def fetch_with_playwright(url):
                 js_urls = page.evaluate("""
                     () => {
                         const urls = [];
+                        // Standard HTML5 video elements
                         document.querySelectorAll('video').forEach(v => {
                             if (v.currentSrc) urls.push(v.currentSrc);
                             if (v.src) urls.push(v.src);
@@ -283,7 +310,14 @@ def fetch_with_playwright(url):
                             v.querySelectorAll('source').forEach(s => {
                                 if (s.src) urls.push(s.src);
                             });
+                            // data-* attributes (WordPress video plugins, fluid-player, etc.)
+                            ['data-src', 'data-url', 'data-video', 'data-fluid-hd',
+                             'data-mobile-url', 'data-hd-file', 'data-sd-file'].forEach(attr => {
+                                const val = v.getAttribute(attr);
+                                if (val && val.startsWith('http')) urls.push(val);
+                            });
                         });
+
                         // Check for common player APIs
                         if (window.player && window.player.src) urls.push(
                             typeof window.player.src === 'function'
@@ -291,6 +325,37 @@ def fetch_with_playwright(url):
                         );
                         if (window.videoUrl) urls.push(window.videoUrl);
                         if (window.video_url) urls.push(window.video_url);
+
+                        // Fluid Player — common on WordPress video sites
+                        try {
+                            if (window.fluidPlayer || document.querySelector('.fluid_video_wrapper')) {
+                                document.querySelectorAll('.fluid_video_wrapper video, [id*=fluid] video').forEach(v => {
+                                    if (v.currentSrc) urls.push(v.currentSrc);
+                                    if (v.src) urls.push(v.src);
+                                });
+                            }
+                        } catch(e) {}
+
+                        // JW Player
+                        try {
+                            if (window.jwplayer) {
+                                const jw = jwplayer();
+                                if (jw && jw.getPlaylistItem) {
+                                    const item = jw.getPlaylistItem();
+                                    if (item && item.file) urls.push(item.file);
+                                    if (item && item.sources) {
+                                        item.sources.forEach(s => { if (s.file) urls.push(s.file); });
+                                    }
+                                }
+                            }
+                        } catch(e) {}
+
+                        // DPlayer (common in Chinese sites)
+                        try {
+                            if (window.dp && window.dp.video) {
+                                if (window.dp.video.src) urls.push(window.dp.video.src);
+                            }
+                        } catch(e) {}
 
                         // Twitter/X: extract from React internal state
                         try {
@@ -307,16 +372,16 @@ def fetch_with_playwright(url):
                             }
                         } catch(e) {}
 
-                        // Search for video URLs in all script tags
+                        // Generic: search all script tags for video URLs
                         try {
                             const scripts = document.querySelectorAll('script');
-                            const videoRegex = /https?:\\/\\/video\\.twimg\\.com\\/[^"'\\s]+\\.mp4[^"'\\s]*/g;
-                            const m3u8Regex = /https?:\\/\\/video\\.twimg\\.com\\/[^"'\\s]+\\.m3u8[^"'\\s]*/g;
+                            const genericVideoRegex = /https?:\/\/[^"'\s\\]+\.(?:mp4|m3u8)(?:\?[^"'\s\\]*)*/g;
+                            const twitterRegex = /https?:\/\/video\.twimg\.com\/[^"'\s]+\.mp4[^"'\s]*/g;
                             scripts.forEach(s => {
                                 if (s.textContent) {
-                                    const mp4Matches = s.textContent.match(videoRegex) || [];
-                                    const m3u8Matches = s.textContent.match(m3u8Regex) || [];
-                                    urls.push(...mp4Matches, ...m3u8Matches);
+                                    const mp4Matches = s.textContent.match(genericVideoRegex) || [];
+                                    const twitterMatches = s.textContent.match(twitterRegex) || [];
+                                    urls.push(...mp4Matches, ...twitterMatches);
                                 }
                             });
                         } catch(e) {}
@@ -357,7 +422,8 @@ def extract_video_urls(html, base_url):
     urls = []
 
     for tag in soup.find_all(["video", "source"]):
-        for attr in ("src", "data-src", "data-url", "data-video"):
+        for attr in ("src", "data-src", "data-url", "data-video",
+                     "data-fluid-hd", "data-mobile-url", "data-hd-file", "data-sd-file"):
             val = tag.get(attr)
             if val:
                 urls.append(("html-tag", _resolve(val, base_url)))
