@@ -1108,7 +1108,12 @@ def download_video(
                 result = _validate_downloaded_file(ts_path)
                 _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
                 return result
-            raise RuntimeError("HLS download failed with both ffmpeg and native downloader.")
+            raise RuntimeError(
+                "HLS stream returned 403 Forbidden — the stream token has likely expired. "
+                "These links are time-limited (5-15 minutes). "
+                "Send the original page URL instead (e.g. https://pornavhd.com/...) "
+                "and the bot will extract a fresh stream link automatically."
+            )
 
         # Non-m3u8 direct downloads (mp4, webm, etc.)
         # Use proper headers even for generic direct URLs
