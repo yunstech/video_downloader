@@ -80,6 +80,7 @@ CDN_REFERER_MAP = {
     "cdn13.com": "https://www.xvideos.com/",
     "xhcdn.com": "https://www.xhamster.com/",
     "rdtcdn.com": "https://www.redtube.com/",
+    "growcdnssedge.com": "https://pornavhd.com/",
 }
 
 # Known ad URL patterns to filter out from scraped results
@@ -1387,9 +1388,9 @@ def download_video(
         u_lower = u.lower()
         # m3u8 playlists — best (gives us ALL segments)
         if ".m3u8" in u_lower:
-            # Deprioritize m3u8 from known ad-injecting CDNs
-            if any(ad in u_lower for ad in ("tiktokcdn.com",)):
-                return (0, 2)  # ad m3u8
+            # Deprioritize m3u8 from known ad-wrapping/injecting CDNs
+            if any(ad in u_lower for ad in ("tiktokcdn.com", "playrecord.biz")):
+                return (0, 2)  # ad-gated m3u8
             return (0, 0)
         # Individual .ts segments — worst (only a few seconds)
         if u_lower.split("?")[0].endswith(".ts"):
@@ -1410,6 +1411,10 @@ def download_video(
         logger.debug(f"URL candidates ({len(downloadable)}):")
         for i, (src, u) in enumerate(downloadable[:10]):
             logger.debug(f"  [{i}] ({src}) {u[:100]}")
+
+    # Collect all m3u8 URLs for fallback attempts
+    m3u8_candidates = [(src, u) for src, u in downloadable if ".m3u8" in u.lower()]
+    non_m3u8_candidates = [(src, u) for src, u in downloadable if ".m3u8" not in u.lower()]
 
     _, chosen_url = downloadable[0]
     logger.info(f"Selected URL: {chosen_url[:100]}...")
@@ -1434,19 +1439,30 @@ def download_video(
         if not output_path.lower().endswith((".mp4", ".ts")):
             output_path = os.path.splitext(output_path)[0] + ".mp4"
 
-        # Try ffmpeg first (most reliable for HLS — downloads ALL segments)
-        success = _download_m3u8_ffmpeg(
-            chosen_url, output_path, referer=download_referer,
-            progress_callback=_update, cookies=playwright_cookies
-        )
+        success = False
+        # Try each m3u8 candidate until one works
+        for m3u8_idx, (m3u8_src, m3u8_url) in enumerate(m3u8_candidates):
+            if m3u8_idx > 0:
+                _update(f"⬇️ Trying alternate stream ({m3u8_idx + 1}/{len(m3u8_candidates)})...")
+                logger.info(f"Trying m3u8 candidate [{m3u8_idx}]: {m3u8_url[:100]}")
 
-        # Fallback to native downloader if ffmpeg unavailable or failed
-        if not success:
+            # Determine referer for this specific URL
+            _cdn_ref = _get_cdn_referer(urlparse(m3u8_url).netloc.lower())
+            _referer = _cdn_ref if _cdn_ref else url
+
+            # Try ffmpeg first
+            success = _download_m3u8_ffmpeg(
+                m3u8_url, output_path, referer=_referer,
+                progress_callback=_update, cookies=playwright_cookies
+            )
+            if success:
+                break
+
+            # Fallback to native downloader
             logger.info("ffmpeg HLS failed, trying native m3u8 downloader")
             if session is None:
                 import requests as req
                 session = req.Session()
-                # Inject cookies from Playwright browser session
                 if playwright_cookies:
                     for cookie in playwright_cookies:
                         session.cookies.set(
@@ -1462,11 +1478,14 @@ def download_video(
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
-                "Referer": download_referer,
+                "Referer": _referer,
             })
             success = download_m3u8_native(
-                chosen_url, output_path, url, session, workers=workers
+                m3u8_url, output_path, url, session, workers=workers
             )
+            if success:
+                break
+            logger.warning(f"m3u8 candidate [{m3u8_idx}] failed: {m3u8_url[:80]}")
     else:
         # Try our improved direct downloader first
         result = _download_direct_with_headers(
