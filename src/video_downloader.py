@@ -860,20 +860,22 @@ def _merge_with_ffmpeg(segment_files, output_path, tmp_dir):
     if not output_path.lower().endswith(".mp4"):
         output_path = os.path.splitext(output_path)[0] + ".mp4"
 
-    concat_path = os.path.join(tmp_dir, "concat.txt")
-    with open(concat_path, "w") as f:
-        for seg in segment_files:
-            # Escape single quotes in path
-            safe_path = seg.replace("'", "'\\''")
-            f.write(f"file '{safe_path}'\n")
-
     print(f"  🎬 Muxing to MP4 with ffmpeg...")
 
+    # Step 1: Binary-concatenate all TS segments into one .ts file.
+    # MPEG-TS is designed for byte-level concatenation — this preserves codec
+    # info that ffmpeg's "concat" demuxer can misidentify (e.g. treating H.264 as PNG).
+    combined_ts = os.path.join(tmp_dir, "combined.ts")
+    with open(combined_ts, "wb") as outf:
+        for seg in segment_files:
+            with open(seg, "rb") as inf:
+                shutil.copyfileobj(inf, outf)
+
+    # Step 2: Remux the single .ts to .mp4
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-        "-fflags", "+genpts+igndts",  # Regenerate PTS, ignore DTS errors
-        "-f", "concat", "-safe", "0",
-        "-i", concat_path,
+        "-fflags", "+genpts+igndts",
+        "-i", combined_ts,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         "-movflags", "+faststart",
@@ -882,31 +884,42 @@ def _merge_with_ffmpeg(segment_files, output_path, tmp_dir):
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
+    if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {output_path}")
+        try:
+            os.remove(combined_ts)
+        except OSError:
+            pass
         return True
 
-    # aac_adtstoasc may fail if audio isn't AAC — retry without it
+    # Retry without aac_adtstoasc (audio may not be AAC)
     print(f"  ⚠️  ffmpeg muxing failed, retrying without aac filter...")
     cmd2 = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
         "-fflags", "+genpts+igndts",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_path,
+        "-i", combined_ts,
         "-c", "copy",
         "-movflags", "+faststart",
         "-ignore_unknown",
         output_path,
     ]
     result2 = subprocess.run(cmd2, capture_output=True, text=True)
-    if result2.returncode == 0:
+    if result2.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"\n  ✅ Download complete! ({size_mb:.1f} MB) → {output_path}")
+        try:
+            os.remove(combined_ts)
+        except OSError:
+            pass
         return True
 
     print(f"  ⚠️  ffmpeg muxing error: {result2.stderr[:200]}")
     print(f"  Falling back to direct merge...")
+    try:
+        os.remove(combined_ts)
+    except OSError:
+        pass
         return _merge_direct(segment_files, output_path)
 
 
