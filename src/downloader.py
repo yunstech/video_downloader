@@ -1051,17 +1051,32 @@ def download_video(
         if ".m3u8" in url.lower():
             if not output_path.lower().endswith((".mp4", ".ts")):
                 output_path = os.path.splitext(output_path)[0] + ".mp4"
-            # Use the stream host origin as referer (e.g. https://playrecord.biz/)
+            # Build list of referers to try — stream CDNs often require the
+            # embedding page's origin, which we don't know for raw m3u8 URLs
             from urllib.parse import urlparse as _urlparse
             _parsed = _urlparse(url)
-            stream_referer = f"{_parsed.scheme}://{_parsed.netloc}/"
+            stream_origin = f"{_parsed.scheme}://{_parsed.netloc}/"
+            # Common embedding sites for known stream CDNs
+            _stream_referer_map = {
+                "playrecord.biz": "https://pornavhd.com/",
+            }
+            # Try: mapped referer first, then stream origin, then no referer
+            referers_to_try = []
+            mapped_ref = _stream_referer_map.get(_parsed.netloc)
+            if mapped_ref:
+                referers_to_try.append(mapped_ref)
+            referers_to_try.extend([stream_origin, ""])
+
             _update("⬇️ Downloading HLS stream...")
-            # Try ffmpeg first (most reliable for HLS)
-            success = _download_m3u8_ffmpeg(
-                url, output_path, referer=stream_referer, progress_callback=_update
-            )
-            # Fallback to native
-            if not success:
+            success = False
+            for ref in referers_to_try:
+                logger.info(f"HLS: trying referer={ref or '(none)'}")
+                success = _download_m3u8_ffmpeg(
+                    url, output_path, referer=ref, progress_callback=_update
+                )
+                if success:
+                    break
+                # Also try native downloader with this referer
                 import requests as req
                 fallback_session = req.Session()
                 fallback_session.headers.update({
@@ -1070,11 +1085,19 @@ def download_video(
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/120.0.0.0 Safari/537.36"
                     ),
-                    "Referer": stream_referer,
                 })
-                success = download_m3u8_native(
-                    url, output_path, url, session=fallback_session, workers=workers
-                )
+                if ref:
+                    fallback_session.headers["Referer"] = ref
+                try:
+                    success = download_m3u8_native(
+                        url, output_path, ref or url, session=fallback_session, workers=workers
+                    )
+                except Exception as e:
+                    logger.warning(f"HLS native failed with referer={ref or '(none)'}: {e}")
+                    success = False
+                if success:
+                    break
+
             if success and os.path.exists(output_path):
                 result = _validate_downloaded_file(output_path)
                 _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
