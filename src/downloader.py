@@ -723,7 +723,8 @@ def _download_m3u8_ffmpeg(
         "-fflags", "+genpts+igndts",
     ]
 
-    # Add headers
+    # Add headers — do NOT send Origin (stream CDNs like playrecord.biz
+    # reject cross-origin requests; IDM works because it doesn't send Origin)
     headers_str = (
         f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -731,7 +732,6 @@ def _download_m3u8_ffmpeg(
     )
     if referer:
         headers_str += f"Referer: {referer}\r\n"
-        headers_str += f"Origin: {referer.rstrip('/')}\r\n"
 
     cmd.extend([
         "-headers", headers_str,

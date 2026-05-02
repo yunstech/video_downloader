@@ -77,10 +77,8 @@ def _make_headers(referer=None):
     headers = {**COMMON_HEADERS}
     if referer:
         headers["Referer"] = referer
-        headers["Origin"] = (
-            urllib.parse.urlparse(referer).scheme + "://" +
-            urllib.parse.urlparse(referer).netloc
-        )
+        # Do NOT send Origin — stream CDNs (e.g. playrecord.biz) reject
+        # cross-origin requests. IDM works precisely because it omits Origin.
     return headers
 
 
