@@ -152,12 +152,16 @@ def fetch_with_curl_cffi(url):
 
 
 def fetch_with_playwright(url):
+    """
+    Fetch page with Playwright, capture video URLs from network traffic.
+    Returns (html, video_urls, cookies) where cookies is a list of dicts.
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         print("  ⚠️  Playwright not installed. Run:")
         print("     pip install playwright && playwright install chromium")
-        return None, []
+        return None, [], []
 
     print("  🌐 Launching headless Chromium...")
     with sync_playwright() as p:
@@ -405,12 +409,15 @@ def fetch_with_playwright(url):
             video_network_urls = deduped
 
             print(f"  ✅ Page loaded ({len(html)} bytes), captured {len(video_network_urls)} video URL(s)")
+
+            # Extract cookies from the browser context for use in downloads
+            cookies = context.cookies()
             browser.close()
-            return html, video_network_urls
+            return html, video_network_urls, cookies
         except Exception as e:
             print(f"  ❌ Playwright error: {e}")
             browser.close()
-            return None, []
+            return None, [], []
 
 
 # ── Video URL Extraction ─────────────────────────────────────────────────────
@@ -1238,8 +1245,8 @@ def main():
     if html is None and args.method in ("auto", "playwright"):
         print("\n[Method 2] Playwright (headless browser)...")
         result = fetch_with_playwright(page_url)
-        if result:
-            html, network_urls = result
+        if result and result[0] is not None:
+            html, network_urls, _ = result
 
     if html is None:
         print("\n❌ Could not fetch the page. Install one of:")

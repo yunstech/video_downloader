@@ -97,6 +97,8 @@ AD_URL_PATTERNS = (
     "popads.net",
     "plugrush.com",
     "ad.doubleclick.net",
+    "tiktokcdn.com",
+    "googlesyndication.com",
     "/ad/",
     "/ads/",
     "/adserver/",
@@ -678,6 +680,7 @@ def _download_m3u8_ffmpeg(
     output_path: str,
     referer: str = "",
     progress_callback=None,
+    cookies=None,
 ) -> bool:
     """
     Download an HLS stream using ffmpeg.
@@ -735,6 +738,23 @@ def _download_m3u8_ffmpeg(
 
     cmd.extend([
         "-headers", headers_str,
+    ])
+
+    # Add cookies from browser session (needed for CDNs like playrecord.biz)
+    if cookies:
+        # Format cookies for ffmpeg: "name=value; name2=value2\r\n"
+        cookie_parts = []
+        for c in cookies:
+            name = c.get("name", "")
+            value = c.get("value", "")
+            if name:
+                cookie_parts.append(f"{name}={value}")
+        if cookie_parts:
+            cookies_str = "; ".join(cookie_parts) + "\r\n"
+            cmd.extend(["-cookies", cookies_str])
+            logger.debug(f"ffmpeg: passing {len(cookie_parts)} cookies")
+
+    cmd.extend([
         "-i", m3u8_url,
         "-c", "copy",           # no re-encoding, just copy streams
         "-bsf:a", "aac_adtstoasc",  # fix AAC stream for mp4 container
@@ -1225,14 +1245,15 @@ def download_video(
     html = None
     session = None
     network_urls = []
+    playwright_cookies = []
 
     # Try Playwright first (better for embedded videos, captures real network requests)
     if method in ("auto", "playwright"):
         _update("🌐 Launching headless browser (Playwright)...")
         result = fetch_with_playwright(url)
-        if result:
-            html, network_urls = result
-            logger.debug(f"Playwright: got {len(html)} chars HTML, {len(network_urls)} network URLs captured")
+        if result and result[0] is not None:
+            html, network_urls, playwright_cookies = result
+            logger.debug(f"Playwright: got {len(html)} chars HTML, {len(network_urls)} network URLs captured, {len(playwright_cookies)} cookies")
         else:
             logger.debug("Playwright: returned no result")
 
@@ -1366,20 +1387,29 @@ def download_video(
         u_lower = u.lower()
         # m3u8 playlists — best (gives us ALL segments)
         if ".m3u8" in u_lower:
-            return 0
+            # Deprioritize m3u8 from known ad-injecting CDNs
+            if any(ad in u_lower for ad in ("tiktokcdn.com",)):
+                return (0, 2)  # ad m3u8
+            return (0, 0)
         # Individual .ts segments — worst (only a few seconds)
         if u_lower.split("?")[0].endswith(".ts"):
-            return 4
+            return (4, 0)
         # Direct mp4 — great
         if ".mp4" in u_lower:
-            return 1
+            return (1, 0)
         # Network-captured (non-ts, non-m3u8)
         if source == "network-capture":
-            return 2
+            return (2, 0)
         # Everything else
-        return 3
+        return (3, 0)
 
     downloadable.sort(key=_url_priority)
+
+    # Log all candidates for debugging
+    if len(downloadable) > 1:
+        logger.debug(f"URL candidates ({len(downloadable)}):")
+        for i, (src, u) in enumerate(downloadable[:10]):
+            logger.debug(f"  [{i}] ({src}) {u[:100]}")
 
     _, chosen_url = downloadable[0]
     logger.info(f"Selected URL: {chosen_url[:100]}...")
@@ -1407,7 +1437,7 @@ def download_video(
         # Try ffmpeg first (most reliable for HLS — downloads ALL segments)
         success = _download_m3u8_ffmpeg(
             chosen_url, output_path, referer=download_referer,
-            progress_callback=_update
+            progress_callback=_update, cookies=playwright_cookies
         )
 
         # Fallback to native downloader if ffmpeg unavailable or failed
@@ -1416,6 +1446,16 @@ def download_video(
             if session is None:
                 import requests as req
                 session = req.Session()
+                # Inject cookies from Playwright browser session
+                if playwright_cookies:
+                    for cookie in playwright_cookies:
+                        session.cookies.set(
+                            cookie.get("name", ""),
+                            cookie.get("value", ""),
+                            domain=cookie.get("domain", ""),
+                            path=cookie.get("path", "/"),
+                        )
+                    logger.debug(f"Injected {len(playwright_cookies)} Playwright cookies into session")
             session.headers.update({
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
