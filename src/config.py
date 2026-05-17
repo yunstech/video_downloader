@@ -63,3 +63,10 @@ MAX_JOBS_PER_USER = int(os.getenv("MAX_JOBS_PER_USER", "50"))
 # ── ConvertHub API (ts → mp4 conversion) ────────────────────────────────────
 
 CONVERTHUB_API_KEY = os.getenv("CONVERTHUB_API_KEY", "")
+
+# ── Terabox credentials (required for downloading) ───────────────────────────
+# Get BDUSS by logging into terabox.com, opening DevTools → Application →
+# Cookies → terabox.com, and copying the "BDUSS" value.
+# STOKEN is the "STOKEN" cookie value (optional but recommended).
+TERABOX_BDUSS = os.getenv("TERABOX_BDUSS", "")
+TERABOX_STOKEN = os.getenv("TERABOX_STOKEN", "")
