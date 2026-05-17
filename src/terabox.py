@@ -462,10 +462,13 @@ class TeraboxDownloader:
     def _fetch_via_playwright(self, share_url: str) -> dict | None:
         """
         Launch headless Chromium, load the share page, and capture:
-        - jsToken (from /api/shorturlinfo request URL or window.jsToken)
-        - pcftoken (from cookies)
+        - jsToken (from shorturlinfo request URL, window.jsToken, or page HTML)
+        - pcftoken / csrfToken (from cookies)
         - sign, timestamp, shareid, uk, file list (from shorturlinfo response)
         - all session cookies for subsequent requests
+
+        If the page doesn't auto-call shorturlinfo (bot detection), falls back to
+        calling it directly with the captured anonymous cookies.
         """
         try:
             from playwright.sync_api import sync_playwright
@@ -477,12 +480,26 @@ class TeraboxDownloader:
 
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-extensions",
+                    ],
+                )
                 context = browser.new_context(
                     user_agent=UA,
                     viewport={"width": 1280, "height": 720},
+                    locale="en-US",
+                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                 )
                 page = context.new_page()
+                # Hide webdriver flag to avoid bot detection
+                page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
 
                 def on_request(request):
                     req_url = request.url
@@ -524,14 +541,16 @@ class TeraboxDownloader:
                 page.on("response", on_response)
 
                 try:
-                    page.goto(share_url, wait_until="networkidle", timeout=35000)
+                    page.goto(share_url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
-                    # Partial loads (timeout on non-critical resources) are acceptable
-                    logger.warning(f"Terabox Playwright: page load warning (partial load OK): {e}")
+                    logger.warning(f"Terabox Playwright: goto warning: {e}")
+
+                # Extra wait for page JS and XHR calls to fire
+                page.wait_for_timeout(5000)
 
                 # Try window.jsToken if not captured from network intercept
                 if not captured.get("jsToken"):
-                    for js_expr in ("window.jsToken", "window.YZToken"):
+                    for js_expr in ("window.jsToken", "window.YZToken", "window.bdstoken"):
                         try:
                             val = page.evaluate(js_expr)
                             if val and isinstance(val, str) and len(val) > 20:
@@ -541,17 +560,26 @@ class TeraboxDownloader:
                         except Exception:
                             pass
 
+                # Search page HTML for embedded jsToken if still missing
+                if not captured.get("jsToken"):
+                    try:
+                        content = page.content()
+                        for pat in (
+                            r'"jsToken"\s*[=:]\s*"([A-Fa-f0-9]{30,})"',
+                            r"'jsToken'\s*[=:]\s*'([A-Fa-f0-9]{30,})'",
+                            r'jsToken\s*=\s*"([A-Fa-f0-9]{30,})"',
+                        ):
+                            m = re.search(pat, content)
+                            if m:
+                                captured["jsToken"] = m.group(1)
+                                logger.debug(f"Terabox: jsToken from page HTML ({len(captured['jsToken'])} chars)")
+                                break
+                    except Exception as e:
+                        logger.debug(f"Terabox: HTML jsToken search error: {e}")
+
                 # Capture all cookies
-                cookies_dict = {}
-                for c in context.cookies():
-                    cookies_dict[c["name"]] = c["value"]
-
-                if "pcftoken" in cookies_dict:
-                    captured["pcftoken"] = cookies_dict["pcftoken"]
-                elif "csrfToken" in cookies_dict:
-                    # csrfToken is functionally equivalent to pcftoken in some flows
-                    captured["pcftoken"] = cookies_dict["csrfToken"]
-
+                cookies_dict = {c["name"]: c["value"] for c in context.cookies()}
+                captured["pcftoken"] = cookies_dict.get("pcftoken") or cookies_dict.get("csrfToken", "")
                 captured["cookies"] = cookies_dict
                 browser.close()
 
@@ -559,21 +587,67 @@ class TeraboxDownloader:
             logger.warning(f"Terabox Playwright: unexpected error: {e}")
             return None
 
-        has_token = bool(captured.get("jsToken"))
-        has_share = bool(captured.get("sign"))
         logger.info(
-            f"Terabox Playwright: jsToken={has_token}, share_info={has_share}, "
-            f"cookies={len(captured.get('cookies', {}))}, pcftoken={'pcftoken' in captured}"
+            f"Terabox Playwright: jsToken={'jsToken' in captured}, "
+            f"sign={'sign' in captured}, cookies={len(captured.get('cookies', {}))}, "
+            f"pcftoken={bool(captured.get('pcftoken'))}"
         )
 
-        if not has_token or not has_share:
+        # If the page didn't auto-call shorturlinfo (e.g. bot detection served a
+        # different page), try calling it directly with the captured anonymous cookies.
+        if captured.get("jsToken") and not captured.get("sign"):
+            logger.info("Terabox: sign not intercepted, calling shorturlinfo directly with browser cookies")
+            info = self._get_share_info_with_cookies(
+                captured["cookies"], captured.get("jsToken", "")
+            )
+            if info:
+                captured.update(info)
+
+        if not captured.get("jsToken") or not captured.get("sign"):
             logger.warning(
-                f"Terabox Playwright: incomplete capture — "
+                f"Terabox Playwright: incomplete — "
                 f"jsToken={'jsToken' in captured}, sign={'sign' in captured}"
             )
             return None
 
         return captured
+
+    def _get_share_info_with_cookies(self, cookies: dict, js_token: str = "") -> dict | None:
+        """Call /api/shorturlinfo using anonymous browser cookies (no BDUSS)."""
+        sess = requests.Session()
+        sess.headers.update({
+            "User-Agent": UA,
+            "Accept": "application/json, */*",
+            "X-Requested-With": "XMLHttpRequest",
+        })
+        for name, value in cookies.items():
+            sess.cookies.set(name, value, domain=".terabox.com")
+
+        params = f"app_id=250528&shorturl=1{self.surl}&root=1"
+        if js_token:
+            params += f"&jsToken={js_token}"
+        url = f"{BASE}/api/shorturlinfo?{params}"
+
+        for attempt in range(3):
+            try:
+                resp = sess.get(url, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("errno") == 0:
+                        logger.info(f"Terabox: shorturlinfo via cookies OK (shareid={data.get('shareid')})")
+                        return {
+                            "sign": data.get("sign", ""),
+                            "timestamp": str(data.get("timestamp", "")),
+                            "shareid": str(data.get("shareid", "")),
+                            "uk": str(data.get("uk", "")),
+                            "randsk": data.get("randsk", ""),
+                            "list": data.get("list", []),
+                        }
+                    logger.warning(f"Terabox: shorturlinfo errno={data.get('errno')}: {data.get('errmsg','')}")
+            except Exception as e:
+                logger.warning(f"Terabox: shorturlinfo attempt {attempt+1}: {e}")
+            time.sleep(1.5)
+        return None
 
     def _get_download_link_dm(self, fs_id: str) -> str | None:
         """Get download URL via dm.terabox.com using jsToken + pcftoken."""
