@@ -219,11 +219,16 @@ class TeraboxDownloader:
 
     def get_download_link(self, fs_id: str) -> str | None:
         """Get a direct CDN download URL for a file by fs_id."""
-        if self.js_token and self.pfc_token and self.sign:
+        if self.js_token and self.sign:
+            # Primary: www.terabox.com + jsToken (handles fs_id correctly, bypasses verify_v2)
+            link = self._get_download_link_www_with_token(fs_id)
+            if link:
+                return link
+            # Secondary: dm.terabox.com (works for single-file shares)
             link = self._get_download_link_dm(fs_id)
             if link:
                 return link
-            logger.warning("Terabox: dm approach failed, falling back to BDUSS")
+            logger.warning("Terabox: token-based approaches failed, falling back to BDUSS")
 
         if self.bduss and self.sign:
             return self._get_download_link_bduss(fs_id)
@@ -647,6 +652,42 @@ class TeraboxDownloader:
             except Exception as e:
                 logger.warning(f"Terabox: shorturlinfo attempt {attempt+1}: {e}")
             time.sleep(1.5)
+        return None
+
+    def _get_download_link_www_with_token(self, fs_id: str) -> str | None:
+        """Get download URL via www.terabox.com with jsToken+pcftoken to bypass verify_v2."""
+        params = (
+            f"sign={self.sign}&timestamp={self.timestamp}"
+            f"&fs_id={fs_id}&shareid={self.shareid}&uk={self.uk}"
+            f"&channel=dubox&web=1&app_id=250528"
+            f"&jsToken={self.js_token}"
+        )
+        if self.pfc_token:
+            params += f"&pcftoken={self.pfc_token}"
+        if self.randsk:
+            params += f"&randsk={quote(self.randsk)}"
+
+        url = f"{BASE}/share/download?{params}"
+        try:
+            resp = self.session.get(url, allow_redirects=False, timeout=20)
+            logger.debug(f"Terabox www+token: status={resp.status_code}, body={resp.text[:300]}")
+
+            if resp.status_code in (301, 302, 307, 308):
+                return resp.headers.get("Location", "")
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("errno") == 0:
+                    return data.get("dlink") or data.get("downloadLink") or ""
+                err = data.get("errno")
+                if err == 400310:
+                    logger.warning("Terabox www+token: verify_v2 still triggered")
+                else:
+                    logger.warning(f"Terabox www+token: errno={err}: {data.get('errmsg', '')}")
+
+        except Exception as e:
+            logger.warning(f"Terabox www+token download link failed: {e}")
+
         return None
 
     def _get_download_link_dm(self, fs_id: str) -> str | None:
