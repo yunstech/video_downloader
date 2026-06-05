@@ -79,6 +79,21 @@ services:
     mem_limit: 2g
     restart: unless-stopped
 
+  # Dedicated worker for long-running YouTube live recordings.
+  # job_timeout=-1 is set per-job in tasks.py; no --burst flag so it stays alive.
+  live-recorder-worker:
+    build: .
+    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} live-recordings
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - downloads:/app/downloads
+    shm_size: 256m
+    mem_limit: 4g        # recordings can buffer large HLS segment sets
+    restart: unless-stopped
+
   # Optional: RQ Dashboard for monitoring
   # rq-dashboard:
   #   image: eoranged/rq-dashboard

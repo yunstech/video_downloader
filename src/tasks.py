@@ -331,3 +331,112 @@ def download_and_upload(url: str, chat_id: int, status_message_id: int) -> dict:
                     logger.info(f"Cleaned up extra: {efp}")
                 except OSError as e:
                     logger.warning(f"Cleanup failed for extra {efp}: {e}")
+
+
+# ── Live Recording Task ──────────────────────────────────────────────────────
+
+def record_live(
+    url: str,
+    chat_id: int,
+    status_message_id: int,
+    user_id: int,
+    cookies_path: str = None,
+    live_from_start: bool = False,
+) -> dict:
+    """
+    RQ task: record a YouTube live stream at 480p and upload parts to Telegram.
+
+    This job can run for 10+ hours. Use the 'live-recordings' queue which has
+    no job timeout (timeout=-1).
+    """
+    from redis import Redis
+    from src.live_recorder import record_youtube_live
+
+    redis_conn = Redis.from_url(config.REDIS_URL)
+    start_time = time.time()
+
+    def progress_callback(text: str):
+        logger.debug(f"[RECORD] {text}")
+        _edit_message(chat_id, status_message_id, text)
+
+    _edit_message(
+        chat_id,
+        status_message_id,
+        "⏺️ Starting YouTube live recorder…\n"
+        "Quality: 480p · H.264 CRF-28 · AAC 64 kbps\n"
+        "Send /stoprecord to stop early and receive the file.",
+    )
+
+    try:
+        result = record_youtube_live(
+            url=url,
+            output_dir=config.DOWNLOAD_DIR,
+            user_id=user_id,
+            cookies_path=cookies_path,
+            live_from_start=live_from_start,
+            progress_callback=progress_callback,
+            redis_conn=redis_conn,
+        )
+
+        filepaths = result["filepaths"]
+        duration_mins = result["duration_mins"]
+        stopped = result.get("stopped_by_user", False)
+
+        h, m = divmod(duration_mins, 60)
+        status_icon = "🛑 Stopped" if stopped else "✅ Recording complete"
+        _edit_message(
+            chat_id,
+            status_message_id,
+            f"{status_icon} ({h}h {m:02d}m)\n"
+            f"📤 Uploading {len(filepaths)} file(s)…",
+        )
+
+        for i, fpath in enumerate(filepaths, 1):
+            if not os.path.exists(fpath):
+                logger.warning(f"Part file missing: {fpath}")
+                continue
+
+            size_mb = os.path.getsize(fpath) / (1024 * 1024)
+            caption = f"🎬 Live recording — {h}h {m:02d}m"
+            if len(filepaths) > 1:
+                caption += f"\nPart {i} of {len(filepaths)}"
+
+            _edit_message(
+                chat_id,
+                status_message_id,
+                f"📤 Uploading part {i}/{len(filepaths)} ({size_mb:.0f} MB)…",
+            )
+
+            _send_video(chat_id, fpath, caption=caption)
+
+            try:
+                os.remove(fpath)
+            except OSError:
+                pass
+
+        elapsed = time.time() - start_time
+        _edit_message(
+            chat_id,
+            status_message_id,
+            f"✅ Done! Uploaded {len(filepaths)} file(s) in "
+            f"{int(elapsed // 60)}m {int(elapsed % 60)}s.",
+        )
+
+        return {
+            "status": "ok",
+            "duration_mins": duration_mins,
+            "parts": len(filepaths),
+            "stopped_by_user": stopped,
+        }
+
+    except Exception as e:
+        logger.exception(f"[RECORD FAILED] url={url}")
+        err = str(e)
+        if len(err) > 300:
+            err = err[:300] + "…"
+        _edit_message(
+            chat_id,
+            status_message_id,
+            f"❌ Recording failed:\n{err}",
+        )
+        return {"status": "error", "reason": err}

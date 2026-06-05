@@ -413,6 +413,111 @@ def _try_vidara(url: str, output_path: str, progress_callback=None) -> dict | No
     return None
 
 
+def _try_ytdlp_twitter(url: str, download_dir: str, progress_callback=None) -> dict | None:
+    """
+    Download all videos from a Twitter/X tweet using yt-dlp.
+
+    Tweets with multiple media are treated as a playlist by yt-dlp — this
+    function enables playlist mode so every video in the tweet is fetched.
+    Returns a result dict; multi-video tweets include an 'extra_files' list.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        logger.warning("yt-dlp not installed, skipping Twitter download")
+        return None
+
+    def _update(text):
+        logger.info(text)
+        if progress_callback:
+            try:
+                progress_callback(text)
+            except Exception:
+                pass
+
+    unique_prefix = uuid.uuid4().hex[:8]
+    # Use autonumber so each media item in a multi-video tweet gets its own file
+    output_template = os.path.join(
+        download_dir, f"{unique_prefix}_twitter_%(autonumber)03d.%(ext)s"
+    )
+
+    def _ytdlp_progress_hook(d):
+        status = d.get("status", "?")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            downloaded = d.get("downloaded_bytes", 0)
+            speed = d.get("speed") or 0
+            pct = (downloaded / total * 100) if total else 0
+            logger.debug(
+                f"yt-dlp Twitter: {pct:.1f}% speed={speed // 1024:.0f} KB/s"
+            )
+        elif status == "finished":
+            logger.debug(f"yt-dlp Twitter finished: {d.get('filename', '?')}")
+
+    ydl_opts = {
+        "outtmpl": output_template,
+        "format": "best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+        "quiet": False,
+        "no_warnings": False,
+        "noprogress": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "progress_hooks": [_ytdlp_progress_hook],
+        "logger": logging.getLogger("yt_dlp"),
+        "noplaylist": False,  # Allow all media items in a multi-video tweet
+    }
+
+    cookies_file = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "twitter_cookies.txt"
+    )
+    if os.path.exists(cookies_file):
+        ydl_opts["cookiefile"] = cookies_file
+        logger.info("yt-dlp Twitter: using twitter_cookies.txt")
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _update("⬇️ Fetching tweet media info...")
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                logger.warning("yt-dlp Twitter: extract_info returned None")
+                return None
+
+        # Glob for every file written by this run (all share the unique prefix)
+        import glob as _glob
+        pattern = os.path.join(download_dir, f"{unique_prefix}_twitter_*")
+        found = sorted(_glob.glob(pattern))
+        logger.debug(f"yt-dlp Twitter: found files after download: {found}")
+
+        valid = []
+        for fp in found:
+            if os.path.exists(fp):
+                size_mb = os.path.getsize(fp) / (1024 * 1024)
+                if size_mb >= 0.1:  # skip empty/tiny fragments
+                    valid.append({
+                        "filepath": fp,
+                        "filename": os.path.basename(fp),
+                        "size_mb": round(size_mb, 2),
+                    })
+
+        if not valid:
+            logger.warning("yt-dlp Twitter: no valid files found after download")
+            return None
+
+        if len(valid) == 1:
+            return valid[0]
+
+        # Multiple videos — return first with the rest as extra_files
+        result = valid[0].copy()
+        result["extra_files"] = valid[1:]
+        _update(f"📹 Found {len(valid)} videos in tweet")
+        return result
+
+    except Exception as e:
+        logger.warning(f"yt-dlp Twitter failed: {e}", exc_info=True)
+        raise
+
+
 def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | None:
     """
     Try downloading with yt-dlp. Returns result dict on success, None on failure.
@@ -1194,15 +1299,17 @@ def download_video(
             return result
         _update("⚠️ Vidara API failed, falling back to page scraping...")
 
-    # ── Twitter/X: use yt-dlp ────────────────────────────────────────────
+    # ── Twitter/X: use yt-dlp (supports multi-media tweets) ─────────────
     elif any(d in domain for d in TWITTER_DOMAINS):
-        _update("🐦 Twitter/X URL detected, trying yt-dlp...")
-        unique_prefix = uuid.uuid4().hex[:8]
-        output_path = os.path.join(download_dir, f"{unique_prefix}_twitter.mp4")
+        _update("🐦 Twitter/X URL detected, fetching media...")
         try:
-            result = _try_ytdlp(url, output_path, progress_callback=_update)
+            result = _try_ytdlp_twitter(url, download_dir, progress_callback=_update)
             if result:
-                _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+                count = 1 + len(result.get("extra_files") or [])
+                if count > 1:
+                    _update(f"✅ Download complete! {count} videos ({result['size_mb']:.1f} MB first)")
+                else:
+                    _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
                 return result
             raise RuntimeError("yt-dlp returned no result")
         except Exception as e:

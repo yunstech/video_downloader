@@ -10,6 +10,7 @@ Commands:
     /cancel        → Cancel current user's pending job
     <any URL>      → Validate URL, enqueue download job
 """
+import os
 import re
 import logging
 
@@ -29,6 +30,7 @@ from telegram.ext import (
 
 from src import config
 from src.terabox import TERABOX_DOMAINS
+from src.live_recorder import RECORD_STOP_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,8 @@ logger = logging.getLogger(__name__)
 redis_conn = Redis.from_url(config.REDIS_URL)
 queue = Queue("video-downloads", connection=redis_conn)
 terabox_queue = Queue("terabox-downloads", connection=redis_conn)
+# Dedicated queue for live recordings — workers use job_timeout=-1
+live_queue = Queue("live-recordings", connection=redis_conn)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -113,12 +117,17 @@ Send me a URL and I'll download the video for you\\!
 • Direct video links \\(mp4, webm, etc\\.\\)
 • HLS streams \\(m3u8, including encrypted\\)
 • Cloudflare\\-protected pages
+• YouTube live / membership streams
 
 *Commands:*
-/start \\- Show this message
-/help \\- Show this message
-/status \\- Check queue status
-/cancel \\- Cancel your pending download
+/start \- Show this message
+/help \- Show this message
+/status \- Check queue status
+/cancel \- Cancel your pending download
+/record \<URL\> \- Record a YouTube live stream \(480p\)
+/record\_start \<URL\> \- Same but record from the beginning \(DVR\)
+/stoprecord \- Stop your active live recording early
+/setcookies \- Upload cookies\.txt for membership streams
 
 Just paste a URL to get started\\! 🚀
 """
@@ -284,6 +293,244 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Error Handler ────────────────────────────────────────────────────────────
 
+# ── Live Recorder Helpers ───────────────────────────────────────────────────
+
+USER_LIVE_JOB_KEY = "user_live_job:{user_id}"
+
+
+def _cookies_path(user_id: int) -> str:
+    """Return the path where a user's cookies.txt is stored."""
+    return os.path.join(config.COOKIES_DIR, f"{user_id}.txt")
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Return True for youtube.com / youtu.be URLs."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower().replace("www.", "")
+        return host in ("youtube.com", "youtu.be", "m.youtube.com")
+    except Exception:
+        return False
+
+
+# ── /record and /stoprecord Handlers ────────────────────────────────────────
+
+async def cmd_record(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    live_from_start: bool = False,
+):
+    """Handle /record <URL> — enqueue a live recording job."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if not _is_allowed(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /record <YouTube live URL>\n"
+            "Example: /record https://youtube.com/watch?v=XXXX\n\n"
+            "For membership streams, upload your cookies.txt first with /setcookies."
+        )
+        return
+
+    url = args[0].strip()
+    if not _validate_url(url):
+        await update.message.reply_text("⚠️ Invalid URL. Please send an HTTP(S) link.")
+        return
+
+    if not _is_youtube_url(url):
+        await update.message.reply_text(
+            "⚠️ /record only supports YouTube URLs.\n"
+            "For other sites just paste the URL directly."
+        )
+        return
+
+    # Check for existing live recording job
+    live_job_key = USER_LIVE_JOB_KEY.format(user_id=user_id)
+    existing_jid = redis_conn.get(live_job_key)
+    if existing_jid:
+        jid_str = existing_jid.decode() if isinstance(existing_jid, bytes) else existing_jid
+        try:
+            job = Job.fetch(jid_str, connection=redis_conn)
+            if job.get_status() in ("queued", "started"):
+                await update.message.reply_text(
+                    f"⚠️ You already have an active recording (job `{jid_str[:8]}`).\n"
+                    "Use /stoprecord to stop it first.",
+                    parse_mode="Markdown",
+                )
+                return
+        except Exception:
+            pass  # Job gone, allow new one
+
+    cookies_path = _cookies_path(user_id)
+    has_cookies = os.path.isfile(cookies_path)
+
+    status_msg = await update.message.reply_text(
+        f"⏳ Queuing live recording…\n"
+        f"🔗 {url[:80]}{'...' if len(url) > 80 else ''}\n"
+        f"🍪 Cookies: {'✅ found' if has_cookies else '❌ none (use /setcookies for memberships)'}"
+    )
+
+    try:
+        job = live_queue.enqueue(
+            "src.tasks.record_live",
+            kwargs={
+                "url": url,
+                "chat_id": chat_id,
+                "status_message_id": status_msg.message_id,
+                "user_id": user_id,
+                "cookies_path": cookies_path if has_cookies else None,
+                "live_from_start": live_from_start,
+            },
+            job_timeout=-1,   # No timeout — recording can take 10+ hours
+            result_ttl=600,
+        )
+
+        # Store job ID so /stoprecord can find it
+        redis_conn.set(live_job_key, job.id, ex=86400)
+        _track_user_job(user_id, job.id)
+
+        logger.info(f"Live recording job {job.id[:8]} queued for user {user_id}: {url[:80]}")
+
+        await status_msg.edit_text(
+            f"⏺️ Recording queued (job `{job.id[:8]}`)\n"
+            f"🔗 {url[:80]}{'...' if len(url) > 80 else ''}\n"
+            f"🍪 Cookies: {'✅' if has_cookies else '❌ none'}\n"
+            f"📐 Quality: 480p · H.264 CRF-28 · AAC 64 kbps\n"
+            f"🛑 Send /stoprecord to stop early.",
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        logger.exception(f"Failed to queue live recording for {url}")
+        await status_msg.edit_text(f"❌ Failed to queue recording: {str(e)[:100]}")
+
+
+async def cmd_record_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /record_start <URL> — record from beginning (DVR)."""
+    await cmd_record(update, context, live_from_start=True)
+
+
+async def cmd_stoprecord(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stoprecord — set Redis stop flag to gracefully end recording."""
+    user_id = update.effective_user.id
+
+    if not _is_allowed(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    live_job_key = USER_LIVE_JOB_KEY.format(user_id=user_id)
+    existing_jid = redis_conn.get(live_job_key)
+
+    if not existing_jid:
+        await update.message.reply_text("🤷 No active live recording found.")
+        return
+
+    # Set the stop flag — live_recorder polls this and terminates yt-dlp
+    stop_key = RECORD_STOP_KEY.format(user_id=user_id)
+    redis_conn.set(stop_key, "1", ex=300)  # 5-minute TTL as safety
+    redis_conn.delete(live_job_key)
+
+    await update.message.reply_text(
+        "🛑 Stop signal sent.\n"
+        "The recording will finish the current segment, then upload the file."
+    )
+
+
+async def cmd_setcookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setcookies — prompt the user to upload cookies.txt."""
+    user_id = update.effective_user.id
+
+    if not _is_allowed(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    cookies_path = _cookies_path(user_id)
+    if os.path.isfile(cookies_path):
+        size = os.path.getsize(cookies_path)
+        await update.message.reply_text(
+            f"🍪 You already have cookies stored ({size} bytes).\n"
+            "Send a new cookies.txt file to replace them, "
+            "or use /record directly."
+        )
+    else:
+        await update.message.reply_text(
+            "🍪 *How to set cookies for membership streams:*\n\n"
+            "1\. Install the *Get cookies\.txt LOCALLY* browser extension\n"
+            "2\. Visit youtube\.com while logged in\n"
+            "3\. Export cookies as `cookies\.txt` \(Netscape format\)\n"
+            "4\. Send the file here as a document\n\n"
+            "_Your cookies are stored only on this server\._",
+            parse_mode="MarkdownV2",
+        )
+
+
+async def handle_cookies_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle document uploads — save cookies.txt files for membership recording.
+    The file must be named 'cookies.txt' or the user's caption must contain 'cookies'.
+    """
+    user_id = update.effective_user.id
+
+    if not _is_allowed(user_id):
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    filename = (doc.file_name or "").lower()
+    caption = (update.message.caption or "").lower()
+
+    # Only accept files named cookies.txt or sent with a cookies caption
+    if "cookies" not in filename and "cookies" not in caption:
+        return
+
+    # Reject suspiciously large files (> 2 MB)
+    if doc.file_size and doc.file_size > 2 * 1024 * 1024:
+        await update.message.reply_text(
+            "⚠️ File too large. A cookies.txt should be well under 2 MB."
+        )
+        return
+
+    await update.message.reply_text("⬇️ Saving cookies…")
+
+    try:
+        os.makedirs(config.COOKIES_DIR, exist_ok=True)
+        cookies_path = _cookies_path(user_id)
+
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(cookies_path)
+
+        # Basic sanity check — Netscape cookies start with a comment line
+        with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
+            first_line = f.readline()
+        if "netscape" not in first_line.lower() and not first_line.startswith("#"):
+            os.remove(cookies_path)
+            await update.message.reply_text(
+                "⚠️ File doesn't look like a Netscape cookies.txt.\n"
+                "Export from your browser using the \'Get cookies.txt LOCALLY\' extension."
+            )
+            return
+
+        size = os.path.getsize(cookies_path)
+        await update.message.reply_text(
+            f"✅ Cookies saved ({size} bytes).\n"
+            "Use /record <URL> to start recording a membership stream."
+        )
+        logger.info(f"Cookies saved for user {user_id} ({size} bytes)")
+
+    except Exception as e:
+        logger.exception(f"Failed to save cookies for user {user_id}")
+        await update.message.reply_text(f"❌ Failed to save cookies: {str(e)[:100]}")
+
+
+# ── Error Handler ────────────────────────────────────────────────────────────
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Log errors and notify the user if possible."""
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -328,6 +575,13 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("record", cmd_record))
+    app.add_handler(CommandHandler("record_start", cmd_record_start))
+    app.add_handler(CommandHandler("stoprecord", cmd_stoprecord))
+    app.add_handler(CommandHandler("setcookies", cmd_setcookies))
+
+    # Document handler for cookies.txt uploads
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_cookies_upload))
 
     # URL handler: catch any message with an HTTP(S) URL
     app.add_handler(MessageHandler(
