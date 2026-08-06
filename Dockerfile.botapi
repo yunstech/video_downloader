@@ -19,11 +19,16 @@ RUN git clone --recursive --depth=1 https://github.com/tdlib/telegram-bot-api.gi
 
 WORKDIR /build/telegram-bot-api
 
+# NOTE: -j1 (serial) is deliberate for low-RAM hosts. TDLib's heaviest .cpp
+# units need ~1.5-2GB each; parallel compiles OOM on a 2GB box. -g0 strips
+# debug info to further cut compiler memory. Serial build is slow (~20-40 min)
+# but survives 2GB + swap. Prefer the prebuilt image in docker-compose.yml.
 RUN mkdir -p build && cd build && \
     cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_FLAGS="-g0" \
           -DCMAKE_INSTALL_PREFIX:PATH=../install \
           .. && \
-    cmake --build . --target install -j$(nproc)
+    cmake --build . --target install -j1
 
 # ── Stage 2: Minimal runtime image ───────────────────────────────────────────
 FROM ubuntu:22.04

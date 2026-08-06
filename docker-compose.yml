@@ -1,8 +1,10 @@
 services:
   telegram-bot-api:
-    build:
-      context: .
-      dockerfile: Dockerfile.botapi
+    # Prebuilt image — avoids compiling TDLib from source, which OOMs on a 2GB
+    # host. The entrypoint reads the env vars below and starts on port 8081
+    # with --local (TELEGRAM_LOCAL=1). To build from source instead, restore
+    # the `build:`/`command:` block from git and use `Dockerfile.botapi`.
+    image: aiogram/telegram-bot-api:latest
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
@@ -11,11 +13,7 @@ services:
       - telegram-bot-api-data:/var/lib/telegram-bot-api
       - downloads:/app/downloads
     restart: unless-stopped
-    command: >
-      --api-id=${TELEGRAM_API_ID}
-      --api-hash=${TELEGRAM_API_HASH}
-      --local
-      --http-port=8081
+    mem_limit: 320m
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 8081 || curl -s http://localhost:8081/ > /dev/null 2>&1 || exit 1"]
       interval: 20s
@@ -25,9 +23,19 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Cap memory and disable disk persistence: this is a transient job queue,
+    # not a datastore. noeviction makes enqueue fail loudly instead of silently
+    # dropping queued jobs if the cap is ever hit.
+    command: >
+      redis-server
+      --maxmemory 96mb
+      --maxmemory-policy noeviction
+      --save ""
+      --appendonly no
     volumes:
       - redis-data:/data
     restart: unless-stopped
+    mem_limit: 128m
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -45,53 +53,37 @@ services:
         condition: service_started
     volumes:
       - downloads:/app/downloads
-    mem_limit: 512m
+    mem_limit: 256m
     restart: unless-stopped
 
+  # Single consolidated worker for a 2-core / 2GB host.
+  # An RQ worker processes ONE job at a time, so on 2GB you cannot safely run
+  # multiple concurrent download/recording processes (each can spawn ffmpeg +
+  # headless Chromium). This one worker drains all three queues in priority
+  # order: quick video/terabox jobs first, long-running live recordings last.
+  #
+  # Trade-off: while a live recording is running (job_timeout=-1, can be hours)
+  # this worker is busy and other downloads wait in the queue. That is the
+  # honest limit of a 2GB box. If you add RAM later, split this back into
+  # separate `worker` and `live-recorder-worker` services.
   worker:
     build: .
-    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} video-downloads
+    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} video-downloads terabox-downloads live-recordings
     env_file: .env
     depends_on:
       redis:
         condition: service_healthy
+      telegram-bot-api:
+        condition: service_started
     volumes:
       - downloads:/app/downloads
       # Optional: mount Twitter cookies for yt-dlp (Netscape format from x.com)
       # Create an empty file first if you don't have cookies yet:
       #   touch twitter_cookies.txt
       - ./twitter_cookies.txt:/app/twitter_cookies.txt
+    # /dev/shm for headless Chromium; keep modest but non-tiny to avoid crashes.
     shm_size: 256m
-    mem_limit: 2g
-    # Scale workers: docker compose up --scale worker=2 (max for 2-core/8GB)
-    restart: unless-stopped
-
-  terabox-worker:
-    build: .
-    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} terabox-downloads
-    env_file: .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    volumes:
-      - downloads:/app/downloads
-    shm_size: 256m
-    mem_limit: 2g
-    restart: unless-stopped
-
-  # Dedicated worker for long-running YouTube live recordings.
-  # job_timeout=-1 is set per-job in tasks.py; no --burst flag so it stays alive.
-  live-recorder-worker:
-    build: .
-    command: rq worker --url ${REDIS_URL:-redis://redis:6379/0} live-recordings
-    env_file: .env
-    depends_on:
-      redis:
-        condition: service_healthy
-    volumes:
-      - downloads:/app/downloads
-    shm_size: 256m
-    mem_limit: 4g        # recordings can buffer large HLS segment sets
+    mem_limit: 1200m
     restart: unless-stopped
 
   # Optional: RQ Dashboard for monitoring
