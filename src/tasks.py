@@ -24,8 +24,20 @@ logger = logging.getLogger(__name__)
 API_BASE = f"{config.TELEGRAM_BOT_API_URL}/bot{config.TELEGRAM_BOT_TOKEN}"
 
 
+# Last text pushed to each status message, so repeated identical progress
+# lines don't trigger Telegram's "message is not modified" 400.
+_last_message_text: dict[tuple[int, int], str] = {}
+
+
 def _edit_message(chat_id: int, message_id: int, text: str, use_markdown: bool = False):
-    """Edit a Telegram message with the given text."""
+    """Edit a Telegram message with the given text (no-op if unchanged)."""
+    key = (chat_id, message_id)
+    if _last_message_text.get(key) == text:
+        return
+    # Worker processes are long-lived; keep the dedupe cache bounded
+    if len(_last_message_text) > 512:
+        _last_message_text.clear()
+
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -39,7 +51,9 @@ def _edit_message(chat_id: int, message_id: int, text: str, use_markdown: bool =
             json=payload,
             timeout=10,
         )
-        if not resp.ok:
+        if resp.ok:
+            _last_message_text[key] = text
+        else:
             logger.warning(f"Failed to edit message: {resp.text}")
     except Exception as e:
         logger.warning(f"Failed to edit message: {e}")

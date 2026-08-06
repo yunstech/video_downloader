@@ -781,12 +781,119 @@ def _download_direct_with_headers(
     return None
 
 
+# ── ffmpeg HLS tuning ────────────────────────────────────────────────────
+# Seconds ffmpeg may spend opening the playlist before emitting any progress.
+FFMPEG_STARTUP_TIMEOUT = 120
+# Seconds without a single progress tick before we treat the run as hung.
+FFMPEG_STALL_TIMEOUT = 90
+# Absolute ceiling for one ffmpeg attempt.
+FFMPEG_MAX_DURATION = 1800
+# Minimum gap between user-facing progress messages (Telegram edit rate limit).
+FFMPEG_PROGRESS_INTERVAL = 5
+# Socket read/write timeout handed to ffmpeg's HTTP protocol (microseconds).
+FFMPEG_RW_TIMEOUT_US = 30_000_000
+
+# stderr fragments that mean "retrying with a different Referer won't help"
+_FFMPEG_FATAL_MARKERS = (
+    "invalid data found",
+    "moov atom not found",
+    "protocol not found",
+    "unknown protocol",
+    "unrecognized option",
+    "no such file or directory",
+    "does not contain any stream",
+    "server returned 404",   # playlist gone, not an access problem
+    "server returned 410",   # CDN token expired
+    "http error 404",
+    "http error 410",
+)
+# ...and fragments that mean the CDN rejected *us* — a different Referer may work
+_FFMPEG_AUTH_MARKERS = (
+    "server returned 401",
+    "server returned 403",
+    "http error 401",
+    "http error 403",
+    "forbidden",
+    "unauthorized",
+)
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as M:SS or H:MM:SS."""
+    total = int(max(0, seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _parse_ffmpeg_time(value: str) -> float | None:
+    """Parse ffmpeg's out_time (HH:MM:SS.micros) into seconds."""
+    value = value.strip()
+    if not value or value.startswith("N/A"):
+        return None
+    parts = value.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _classify_ffmpeg_error(stderr: str) -> str:
+    """Map ffmpeg stderr to a retry hint: 'auth', 'fatal', or 'other'."""
+    low = stderr.lower()
+    if any(m in low for m in _FFMPEG_FATAL_MARKERS):
+        return "fatal"
+    if any(m in low for m in _FFMPEG_AUTH_MARKERS):
+        return "auth"
+    return "other"
+
+
+def _probe_hls_duration(m3u8_url: str, headers_str: str, cookies_str: str = "") -> float | None:
+    """
+    Best-effort duration probe so progress can be reported as a percentage.
+    Returns None if ffprobe is unavailable, slow, or the stream is live.
+    """
+    import subprocess
+    import shutil
+
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        return None
+
+    cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        "-rw_timeout", str(FFMPEG_RW_TIMEOUT_US),
+        "-headers", headers_str,
+    ]
+    if cookies_str:
+        cmd.extend(["-cookies", cookies_str])
+    cmd.extend([
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        m3u8_url,
+    ])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else None
+    except Exception:
+        return None
+
+
 def _download_m3u8_ffmpeg(
     m3u8_url: str,
     output_path: str,
     referer: str = "",
     progress_callback=None,
     cookies=None,
+    error_out: dict | None = None,
 ) -> bool:
     """
     Download an HLS stream using ffmpeg.
@@ -794,10 +901,30 @@ def _download_m3u8_ffmpeg(
     - Variant/master playlists (auto-selects best quality)
     - Segment retries and reassembly
     - Proper muxing to mp4
+
+    Progress is streamed from `-progress pipe:1` so a hung transfer is detected
+    within FFMPEG_STALL_TIMEOUT instead of blocking for the full timeout.
+
+    Args:
+        error_out: optional dict populated with 'reason' ('auth'/'fatal'/
+            'stall'/'timeout'/'other') and 'stderr' so callers can decide
+            whether retrying with a different Referer is worthwhile.
+
     Returns True on success, False on failure.
     """
     import subprocess
     import shutil
+    import queue
+    import signal
+    import tempfile
+    import threading
+    import time
+
+    def _fail(reason: str, stderr: str = "") -> bool:
+        if error_out is not None:
+            error_out["reason"] = reason
+            error_out["stderr"] = stderr
+        return False
 
     def _update(text):
         logger.info(text)
@@ -810,7 +937,7 @@ def _download_m3u8_ffmpeg(
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         logger.warning("ffmpeg not found in PATH, cannot use ffmpeg for HLS")
-        return False
+        return _fail("fatal", "ffmpeg not installed")
 
     # Ensure output is .mp4
     if not output_path.lower().endswith(".mp4"):
@@ -818,21 +945,7 @@ def _download_m3u8_ffmpeg(
 
     _update("⬇️ Downloading HLS stream with ffmpeg...")
 
-    # Build ffmpeg command
-    cmd = [
-        ffmpeg_path,
-        "-y",  # overwrite output
-        # Essential for HLS streams — allow all required protocols
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        # Handle connection drops (common with CDN-served HLS)
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-        # Fix timestamp issues common in HLS streams
-        "-fflags", "+genpts+igndts",
-    ]
-
-    # Add headers — do NOT send Origin (stream CDNs like playrecord.biz
+    # Headers — do NOT send Origin (stream CDNs like playrecord.biz
     # reject cross-origin requests; IDM works because it doesn't send Origin)
     headers_str = (
         f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -842,23 +955,41 @@ def _download_m3u8_ffmpeg(
     if referer:
         headers_str += f"Referer: {referer}\r\n"
 
-    cmd.extend([
-        "-headers", headers_str,
-    ])
-
-    # Add cookies from browser session (needed for CDNs like playrecord.biz)
+    # Cookies from browser session (needed for CDNs like playrecord.biz)
+    cookies_str = ""
     if cookies:
-        # Format cookies for ffmpeg: "name=value; name2=value2\r\n"
-        cookie_parts = []
-        for c in cookies:
-            name = c.get("name", "")
-            value = c.get("value", "")
-            if name:
-                cookie_parts.append(f"{name}={value}")
+        cookie_parts = [
+            f"{c.get('name', '')}={c.get('value', '')}"
+            for c in cookies if c.get("name")
+        ]
         if cookie_parts:
             cookies_str = "; ".join(cookie_parts) + "\r\n"
-            cmd.extend(["-cookies", cookies_str])
             logger.debug(f"ffmpeg: passing {len(cookie_parts)} cookies")
+
+    total_duration = _probe_hls_duration(m3u8_url, headers_str, cookies_str)
+    if total_duration:
+        logger.info(f"HLS duration: {_fmt_duration(total_duration)}")
+
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-nostdin",  # never block waiting on stdin
+        "-y",        # overwrite output
+        # Essential for HLS streams — allow all required protocols
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        # Fail a stalled socket read instead of hanging forever
+        "-rw_timeout", str(FFMPEG_RW_TIMEOUT_US),
+        # Handle connection drops (common with CDN-served HLS)
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-multiple_requests", "1",
+        # Fix timestamp issues common in HLS streams
+        "-fflags", "+genpts+igndts",
+        "-headers", headers_str,
+    ]
+    if cookies_str:
+        cmd.extend(["-cookies", cookies_str])
 
     cmd.extend([
         "-i", m3u8_url,
@@ -868,51 +999,221 @@ def _download_m3u8_ffmpeg(
         "-max_muxing_queue_size", "1024",  # prevent queue overflow on long videos
         "-ignore_unknown",
         "-loglevel", "warning",
+        "-nostats",
+        "-progress", "pipe:1",  # machine-readable progress on stdout
         output_path,
     ])
 
-    logger.debug(f"ffmpeg cmd: {' '.join(cmd[:6])}... {output_path}")
+    logger.debug(f"ffmpeg cmd: {' '.join(cmd[:8])}... {output_path}")
+
+    stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    proc = None
+    stall_reason = None
+    last_seconds = 0.0
+    last_bytes = 0
+
+    def _read_stderr() -> str:
+        try:
+            stderr_file.seek(0)
+            return stderr_file.read().strip()
+        except Exception:
+            return ""
+
+    def _stop(sig_first: bool) -> None:
+        """
+        Stop ffmpeg. SIGINT first lets it finalize the mp4 (write the moov
+        atom) so a partial download stays playable; Windows has no usable
+        SIGINT for a child process, so it goes straight to terminate/kill.
+        """
+        if proc is None or proc.poll() is not None:
+            return
+        # Graceful stop — must not swallow the escalation path below
+        if sig_first and os.name == "posix":
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=20)
+                return
+            except subprocess.TimeoutExpired:
+                logger.debug("ffmpeg ignored SIGINT, escalating")
+            except Exception as e:
+                logger.debug(f"ffmpeg SIGINT failed ({e}), escalating")
+        for step in (proc.terminate, proc.kill):
+            try:
+                step()
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception as e:
+                logger.debug(f"ffmpeg {step.__name__} failed: {e}")
+        logger.warning("ffmpeg process could not be stopped")
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
             text=True,
-            timeout=1800,  # 30 minute timeout for long videos
+            bufsize=1,
         )
 
-        if result.stderr:
-            logger.debug(f"ffmpeg stderr: {result.stderr.strip()[:500]}")
+        # ffmpeg emits a progress block every ~0.5s once it is muxing; a
+        # dedicated reader thread keeps the main loop free to enforce deadlines.
+        lines: "queue.Queue[str | None]" = queue.Queue()
 
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            logger.warning(f"ffmpeg failed (rc={result.returncode}): {stderr[:200]}")
-            # Clean up partial file
+        def _pump():
+            try:
+                for line in proc.stdout:
+                    lines.put(line)
+            except Exception:
+                pass
+            finally:
+                lines.put(None)
+
+        reader = threading.Thread(target=_pump, daemon=True)
+        reader.start()
+
+        started = time.monotonic()
+        last_tick = started
+        last_report = 0.0
+        saw_progress = False
+        finished = False
+
+        while True:
+            try:
+                line = lines.get(timeout=1.0)
+            except queue.Empty:
+                line = ""
+
+            now = time.monotonic()
+
+            if line is None:  # stdout closed — ffmpeg is done
+                break
+
+            if line:
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+
+                if key == "out_time":
+                    seconds = _parse_ffmpeg_time(value)
+                    if seconds is not None and seconds > last_seconds:
+                        last_seconds = seconds
+                        last_tick = now
+                        saw_progress = True
+                elif key == "total_size":
+                    try:
+                        size = int(value)
+                    except ValueError:
+                        size = last_bytes
+                    if size > last_bytes:
+                        last_bytes = size
+                        last_tick = now
+                        saw_progress = True
+                elif key == "progress" and value == "end":
+                    finished = True
+
+            # Emit a throttled, user-visible progress line
+            if saw_progress and now - last_report >= FFMPEG_PROGRESS_INTERVAL:
+                last_report = now
+                mb = last_bytes / (1024 * 1024)
+                if total_duration:
+                    pct = min(99.9, last_seconds / total_duration * 100)
+                    _update(
+                        f"⬇️ Downloading HLS… {pct:.0f}% "
+                        f"({_fmt_duration(last_seconds)}/{_fmt_duration(total_duration)}, "
+                        f"{mb:.1f} MB)"
+                    )
+                else:
+                    _update(
+                        f"⬇️ Downloading HLS… {_fmt_duration(last_seconds)} ({mb:.1f} MB)"
+                    )
+
+            if finished:
+                continue
+
+            # Watchdogs
+            idle = now - last_tick
+            limit = FFMPEG_STALL_TIMEOUT if saw_progress else FFMPEG_STARTUP_TIMEOUT
+            if idle > limit:
+                stall_reason = "stall"
+                logger.warning(
+                    f"ffmpeg stalled: no progress for {idle:.0f}s "
+                    f"(downloaded {last_bytes / (1024 * 1024):.1f} MB, "
+                    f"{_fmt_duration(last_seconds)})"
+                )
+                break
+            if now - started > FFMPEG_MAX_DURATION:
+                stall_reason = "timeout"
+                logger.warning(
+                    f"ffmpeg exceeded {FFMPEG_MAX_DURATION}s hard limit "
+                    f"({last_bytes / (1024 * 1024):.1f} MB downloaded)"
+                )
+                break
+
+        if stall_reason:
+            # SIGINT so ffmpeg writes the moov atom — a partial file is only
+            # usable if it exists as a real mp4.
+            _stop(sig_first=True)
+            stderr = _read_stderr()
+            if stderr:
+                logger.debug(f"ffmpeg stderr: {stderr[:500]}")
+
+            # Salvage a mostly-complete download rather than throwing it away
+            file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            fraction = (last_seconds / total_duration) if total_duration else 0.0
+            if fraction >= 0.6 and file_size >= MIN_VIDEO_FILE_SIZE:
+                logger.warning(
+                    f"ffmpeg {stall_reason} at {fraction * 100:.0f}% — "
+                    f"keeping partial file ({file_size / (1024 * 1024):.2f} MB)"
+                )
+                _update(
+                    f"⚠️ Stream stalled at {fraction * 100:.0f}% — "
+                    f"uploading what was downloaded"
+                )
+                return True
+
             if os.path.exists(output_path):
                 os.remove(output_path)
-            return False
+            return _fail(stall_reason, stderr)
+
+        returncode = proc.wait(timeout=30)
+        stderr = _read_stderr()
+        if stderr:
+            logger.debug(f"ffmpeg stderr: {stderr[:500]}")
+
+        if returncode != 0:
+            reason = _classify_ffmpeg_error(stderr)
+            logger.warning(f"ffmpeg failed (rc={returncode}, {reason}): {stderr[:200]}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return _fail(reason, stderr)
 
         if os.path.exists(output_path) and os.path.getsize(output_path) >= MIN_VIDEO_FILE_SIZE:
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             logger.info(f"ffmpeg HLS download success: {output_path} ({size_mb:.2f} MB)")
             return True
-        else:
-            file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-            logger.warning(f"ffmpeg output too small or missing ({file_size} bytes)")
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            return False
 
-    except subprocess.TimeoutExpired:
-        logger.warning("ffmpeg timed out after 600s")
+        file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        logger.warning(f"ffmpeg output too small or missing ({file_size} bytes)")
         if os.path.exists(output_path):
             os.remove(output_path)
-        return False
+        return _fail("other", stderr)
+
     except Exception as e:
         logger.warning(f"ffmpeg failed: {e}", exc_info=True)
+        _stop(sig_first=False)
         if os.path.exists(output_path):
             os.remove(output_path)
-        return False
+        return _fail("other", str(e))
+    finally:
+        _stop(sig_first=False)
+        try:
+            if proc is not None and proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+        stderr_file.close()
 
 
 def _extract_pornhub_video_urls(html: str) -> list:
@@ -1128,9 +1429,13 @@ def download_video(
                     ),
                     "Referer": referer,
                 })
-                success = download_m3u8_native(
-                    url, output_path, url, session=cdn_session, workers=workers
-                )
+                try:
+                    success = download_m3u8_native(
+                        url, output_path, url, session=cdn_session, workers=workers
+                    )
+                except Exception as e:
+                    logger.warning(f"CDN native m3u8 downloader failed: {e}")
+                    success = False
             if success and os.path.exists(output_path):
                 result = _validate_downloaded_file(output_path)
                 _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
@@ -1195,13 +1500,25 @@ def download_video(
 
             _update("⬇️ Downloading HLS stream...")
             success = False
+            # Once ffmpeg reports an error a different Referer can't fix, stop
+            # re-running it — but keep trying the native downloader per referer.
+            skip_ffmpeg = False
             for ref in referers_to_try:
                 logger.info(f"HLS: trying referer={ref or '(none)'}")
-                success = _download_m3u8_ffmpeg(
-                    url, output_path, referer=ref, progress_callback=_update
-                )
-                if success:
-                    break
+                if not skip_ffmpeg:
+                    ff_error = {}
+                    success = _download_m3u8_ffmpeg(
+                        url, output_path, referer=ref, progress_callback=_update,
+                        error_out=ff_error,
+                    )
+                    if success:
+                        break
+                    if ff_error.get("reason") in ("fatal", "stall", "timeout"):
+                        logger.info(
+                            f"ffmpeg gave up ({ff_error.get('reason')}), "
+                            f"native downloader only from here"
+                        )
+                        skip_ffmpeg = True
                 # Also try native downloader with this referer
                 import requests as req
                 fallback_session = req.Session()
@@ -1577,11 +1894,21 @@ def download_video(
 
             # Try ffmpeg with: page referer, m3u8 origin, then NO referer (IDM-style)
             for ff_referer in [_referer, _m3u8_origin, ""]:
+                ff_error = {}
                 success = _download_m3u8_ffmpeg(
                     m3u8_url, output_path, referer=ff_referer,
-                    progress_callback=_update, cookies=playwright_cookies
+                    progress_callback=_update, cookies=playwright_cookies,
+                    error_out=ff_error,
                 )
                 if success:
+                    break
+                # Only a 401/403 is a Referer problem — a stalled transfer or a
+                # malformed playlist repeats identically, so stop burning time.
+                if ff_error.get("reason") != "auth":
+                    logger.info(
+                        f"ffmpeg gave up ({ff_error.get('reason')}), "
+                        f"skipping remaining referers"
+                    )
                     break
             if success:
                 break
@@ -1608,9 +1935,18 @@ def download_video(
                 ),
                 "Referer": _referer,
             })
-            success = download_m3u8_native(
-                m3u8_url, output_path, url, session, workers=workers
-            )
+            # A dead playlist raises (404/timeout) — that must not abort the
+            # whole job, the remaining candidates and yt-dlp still deserve a go.
+            try:
+                success = download_m3u8_native(
+                    m3u8_url, output_path, url, session, workers=workers
+                )
+            except Exception as e:
+                logger.warning(
+                    f"native m3u8 downloader failed for candidate "
+                    f"[{m3u8_idx}]: {e}"
+                )
+                success = False
             if success:
                 break
             logger.warning(f"m3u8 candidate [{m3u8_idx}] failed: {m3u8_url[:80]}")
