@@ -735,7 +735,7 @@ class HLSDecryptor:
 
 # ── HLS Downloader ───────────────────────────────────────────────────────────
 
-def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=8):
+def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=2):
     """Download HLS stream: fetch segments, decrypt if needed, merge."""
 
     # Determine the best referer for segment requests.
@@ -1215,8 +1215,8 @@ def main():
     parser.add_argument("--list-only", action="store_true", help="Only list found URLs")
     parser.add_argument("--method", choices=["auto", "curl_cffi", "playwright"],
                         default="auto", help="Fetch method (default: auto)")
-    parser.add_argument("--threads", type=int, default=8,
-                        help="Download threads for HLS (default: 8)")
+    parser.add_argument("--threads", type=int, default=2,
+                        help="Download threads for HLS (default: 2)")
     args = parser.parse_args()
 
     page_url = args.url

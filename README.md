@@ -94,6 +94,7 @@ docker compose down -v
 | `DOWNLOAD_DIR`           | `/app/downloads`               | Temp directory for downloads             |
 | `MAX_FILE_SIZE_MB`       | `2000`                         | Max file size to upload (MB)             |
 | `MAX_CONCURRENT_DOWNLOADS` | `3`                          | Max simultaneous workers                 |
+| `HLS_WORKERS`            | `2`                          | Threads fetching HLS segments per download |
 | `DOWNLOAD_TIMEOUT`       | `1800`                         | Download timeout in seconds (30 min)     |
 | `ALLOWED_USERS`          | *(empty = public)*             | Comma-separated Telegram user IDs        |
 | `LOG_LEVEL`              | `INFO`                         | Logging level                            |

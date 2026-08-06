@@ -31,6 +31,11 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2000"))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "1800"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 
+# Threads used to fetch HLS segments within a single download.
+# Kept low by default: the worker container is memory-capped and each thread
+# holds a segment in memory while it is decrypted and written.
+HLS_WORKERS = int(os.getenv("HLS_WORKERS", "2"))
+
 # Per-user cookies storage (used for YouTube membership live recordings)
 COOKIES_DIR = os.getenv("COOKIES_DIR", os.path.join(DOWNLOAD_DIR, "cookies"))
 

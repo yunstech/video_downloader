@@ -393,7 +393,7 @@ def _try_vidara(url: str, output_path: str, progress_callback=None) -> dict | No
             output_path,
             referer="https://Vidara.so/",
             session=None,
-            workers=4,
+            workers=config.HLS_WORKERS,
         )
 
         if not success or not os.path.exists(output_path):
@@ -1295,7 +1295,7 @@ def download_video(
     url: str,
     download_dir: str = None,
     method: str = "auto",
-    workers: int = 4,
+    workers: int = config.HLS_WORKERS,
     progress_callback=None,
 ) -> dict:
     """
