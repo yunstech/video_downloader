@@ -394,6 +394,7 @@ def _try_vidara(url: str, output_path: str, progress_callback=None) -> dict | No
             referer="https://Vidara.so/",
             session=None,
             workers=config.HLS_WORKERS,
+            progress_callback=_update,
         )
 
         if not success or not os.path.exists(output_path):
@@ -1431,7 +1432,8 @@ def download_video(
                 })
                 try:
                     success = download_m3u8_native(
-                        url, output_path, url, session=cdn_session, workers=workers
+                        url, output_path, url, session=cdn_session, workers=workers,
+                        progress_callback=_update,
                     )
                 except Exception as e:
                     logger.warning(f"CDN native m3u8 downloader failed: {e}")
@@ -1533,7 +1535,8 @@ def download_video(
                     fallback_session.headers["Referer"] = ref
                 try:
                     success = download_m3u8_native(
-                        url, output_path, ref or url, session=fallback_session, workers=workers
+                        url, output_path, ref or url, session=fallback_session,
+                        workers=workers, progress_callback=_update,
                     )
                 except Exception as e:
                     logger.warning(f"HLS native failed with referer={ref or '(none)'}: {e}")
@@ -1939,7 +1942,8 @@ def download_video(
             # whole job, the remaining candidates and yt-dlp still deserve a go.
             try:
                 success = download_m3u8_native(
-                    m3u8_url, output_path, url, session, workers=workers
+                    m3u8_url, output_path, url, session, workers=workers,
+                    progress_callback=_update,
                 )
             except Exception as e:
                 logger.warning(

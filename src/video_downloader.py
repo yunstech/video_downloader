@@ -29,6 +29,7 @@ import urllib.parse
 import subprocess
 import tempfile
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -735,8 +736,24 @@ class HLSDecryptor:
 
 # ── HLS Downloader ───────────────────────────────────────────────────────────
 
-def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=2):
+# Per-request timeout for a single segment fetch (seconds). A CDN that accepts
+# the connection but never sends data burns this on every attempt.
+SEGMENT_TIMEOUT = 20
+# Once this many segments have completed with zero successes, stop: the CDN is
+# not serving us and grinding through the rest just wastes minutes.
+FAIL_FAST_AFTER = 5
+
+
+def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=2,
+                         progress_callback=None):
     """Download HLS stream: fetch segments, decrypt if needed, merge."""
+
+    def _report(text):
+        if progress_callback:
+            try:
+                progress_callback(text)
+            except Exception:
+                pass
 
     # Determine the best referer for segment requests.
     # Some CDNs validate referer per-segment. Common patterns:
@@ -822,6 +839,8 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=2
         segment_files = [None] * len(segments)
         failed = []
 
+        abort = threading.Event()
+
         def download_and_decrypt(seg):
             seg_path = os.path.join(tmp_dir, f"segment_{seg.index:05d}.ts")
             max_retries = 3
@@ -829,10 +848,14 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=2
             referers_to_try = [segment_referer, referer, None]
 
             for attempt in range(max_retries):
+                # Bail out immediately once the run has been declared dead
+                if abort.is_set():
+                    return seg.index, None, 0, "aborted"
                 # Cycle through referers on retries
                 attempt_referer = referers_to_try[attempt % len(referers_to_try)]
                 try:
-                    r = http_get(seg.url, referer=attempt_referer, session=session)
+                    r = http_get(seg.url, referer=attempt_referer, session=session,
+                                 timeout=SEGMENT_TIMEOUT)
                     r.raise_for_status()
                     data = r.content
 
@@ -865,6 +888,11 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=2
         print(f"  ⬇️  Downloading segments ({workers} threads)...\n")
 
         total_bytes = 0
+        completed = 0
+        succeeded = 0
+        last_report = 0.0
+        aborted_early = False
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(download_and_decrypt, seg): seg.index for seg in segments}
 
@@ -876,7 +904,39 @@ def download_m3u8_native(m3u8_url, output_path, referer, session=None, workers=2
                     else:
                         segment_files[idx] = seg_path
                         total_bytes += size
+                        succeeded += 1
+                    completed += 1
                     pbar.update(1)
+
+                    # Surface progress to the caller (Telegram status message);
+                    # without this the UI freezes for the whole download.
+                    now = time.monotonic()
+                    if now - last_report >= 5:
+                        last_report = now
+                        _report(
+                            f"⬇️ Downloading segments… {completed}/{len(segments)} "
+                            f"({total_bytes / (1024 * 1024):.1f} MB)"
+                        )
+
+                    # Fail fast: nothing has worked, so nothing will. Without
+                    # this the run grinds through every segment's full retry
+                    # budget before the >50%-failed check below is ever reached.
+                    if succeeded == 0 and len(failed) >= min(FAIL_FAST_AFTER, len(segments)):
+                        aborted_early = True
+                        abort.set()
+                        for f in futures:
+                            f.cancel()
+                        print(
+                            f"\n  ❌ Aborting: first {len(failed)} segments all "
+                            f"failed, CDN is not serving this stream"
+                        )
+                        break
+
+        if aborted_early:
+            sample = failed[0][1] if failed else "unknown error"
+            print(f"     First error: {sample}")
+            _report("❌ CDN refused the video segments")
+            return False
 
         if failed:
             print(f"\n  ⚠️  {len(failed)} segment(s) failed:")
