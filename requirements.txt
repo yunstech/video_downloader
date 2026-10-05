@@ -7,5 +7,5 @@ tqdm
 pycryptodome
 requests
 playwright>=1.40
-yt-dlp>=2024.1
+yt-dlp>=2026.8.19
 cloudscraper

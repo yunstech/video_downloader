@@ -67,6 +67,15 @@ ADULT_CDN_DOMAINS = (
 # Twitter/X domains
 TWITTER_DOMAINS = ("x.com", "twitter.com")
 
+# Facebook domains (reels, watch, videos, share links)
+FACEBOOK_DOMAINS = ("facebook.com", "fb.watch", "fb.com")
+
+# Optional Netscape cookies files (project root) handed to yt-dlp per site
+SITE_COOKIE_FILES = (
+    (TWITTER_DOMAINS, "twitter_cookies.txt"),
+    (FACEBOOK_DOMAINS, "facebook_cookies.txt"),
+)
+
 # Terabox domains
 TERABOX_DOMAINS = (
     "terabox.com", "1024terabox.com", "freeterabox.com", "nephobox.com",
@@ -159,6 +168,27 @@ def _validate_downloaded_file(filepath: str) -> dict:
         "filename": os.path.basename(filepath),
         "size_mb": round(size_mb, 2),
     }
+
+
+def _site_cookiefile(domain: str) -> str | None:
+    """Return the cookies.txt path for a site's domain, or None if not present."""
+    for domains, name in SITE_COOKIE_FILES:
+        if not any(d in domain for d in domains):
+            continue
+        cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), name)
+        # A missing host file for the optional Docker bind mount silently becomes
+        # a directory at this path — isfile() rejects that instead of handing
+        # yt-dlp a directory and crashing with "[Errno 21] Is a directory".
+        if os.path.isfile(cookies_file):
+            logger.info(f"yt-dlp: using {name}")
+            return cookies_file
+        if os.path.exists(cookies_file):
+            logger.warning(
+                f"{cookies_file} exists but is not a file (likely an empty Docker "
+                f"bind mount) — proceeding without cookies"
+            )
+        return None
+    return None
 
 
 def _get_cdn_referer(domain: str) -> str:
@@ -469,12 +499,9 @@ def _try_ytdlp_twitter(url: str, download_dir: str, progress_callback=None) -> d
         "noplaylist": False,  # Allow all media items in a multi-video tweet
     }
 
-    cookies_file = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "twitter_cookies.txt"
-    )
-    if os.path.exists(cookies_file):
+    cookies_file = _site_cookiefile("x.com")
+    if cookies_file:
         ydl_opts["cookiefile"] = cookies_file
-        logger.info("yt-dlp Twitter: using twitter_cookies.txt")
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -596,14 +623,24 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
         "noplaylist": True,
     }
 
-    # Use cookies file for Twitter/X if available (needed for auth-gated content)
     from urllib.parse import urlparse as _urlparse
     _domain = _urlparse(url).netloc.lower()
-    if any(d in _domain for d in ("x.com", "twitter.com")):
-        cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "twitter_cookies.txt")
-        if os.path.exists(cookies_file):
-            ydl_opts["cookiefile"] = cookies_file
-            logger.info("yt-dlp: using twitter_cookies.txt")
+
+    # Ad heuristics (short duration / tiny file) are for scraped unknown sites;
+    # on known platforms they'd reject legit short-form clips like FB reels.
+    is_known_platform = any(d in _domain for d in YTDLP_PREFERRED_DOMAINS)
+    if is_known_platform:
+        del ydl_opts["match_filter"]
+
+    # Facebook serves reels as separate DASH video/audio — merge them, since
+    # a single progressive "best" file is often missing or low quality.
+    if any(d in _domain for d in FACEBOOK_DOMAINS):
+        ydl_opts["format"] = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+
+    # Use site cookies file if available (needed for auth-gated content)
+    cookies_file = _site_cookiefile(_domain)
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -626,7 +663,7 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
 
             # Double-check duration after download (safety net)
             duration = info.get("duration")
-            if duration is not None and duration < 30:
+            if not is_known_platform and duration is not None and duration < 30:
                 logger.warning(f"yt-dlp: downloaded video is only {duration}s — likely an ad, discarding")
                 # Clean up the ad file
                 filename = ydl.prepare_filename(info)
@@ -655,7 +692,7 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
             if os.path.exists(filename):
                 size_mb = os.path.getsize(filename) / (1024 * 1024)
                 # Another ad heuristic: if file is tiny (< 1 MB), likely an ad
-                if size_mb < 1.0:
+                if not is_known_platform and size_mb < 1.0:
                     logger.warning(f"yt-dlp: downloaded file is only {size_mb:.2f} MB — likely an ad, discarding")
                     os.remove(filename)
                     return None
@@ -1643,6 +1680,28 @@ def download_video(
                 )
             else:
                 raise RuntimeError(f"Twitter/X download failed: {str(e).splitlines()[0]}")
+
+    # ── Facebook (reels, watch, videos): yt-dlp, usually needs cookies ───
+    elif any(d in domain for d in FACEBOOK_DOMAINS):
+        _update("📘 Facebook URL detected, fetching video...")
+        unique_prefix = uuid.uuid4().hex[:8]
+        output_path = os.path.join(download_dir, f"{unique_prefix}_facebook.mp4")
+        try:
+            result = _try_ytdlp(url, output_path, progress_callback=_update)
+        except Exception as e:
+            err_str = str(e).lower()
+            if _site_cookiefile(domain) is None and any(
+                k in err_str for k in ("cannot parse data", "login", "private", "unavailable")
+            ):
+                raise RuntimeError(
+                    "Facebook requires login to download this video. "
+                    "Add a facebook_cookies.txt file to the bot's data directory."
+                )
+            raise RuntimeError(f"Facebook download failed: {str(e).splitlines()[0]}")
+        if result:
+            _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
+            return result
+        raise RuntimeError("Facebook download failed: yt-dlp returned no result")
 
     # ── Try yt-dlp for other known platforms (YouTube, Instagram, etc.) ──
     elif any(d in domain for d in YTDLP_PREFERRED_DOMAINS):

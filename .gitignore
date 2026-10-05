@@ -36,3 +36,5 @@ Thumbs.db
 !README.md
 *.log
 *.mp4
+# Site cookies (secrets)
+*_cookies.txt
