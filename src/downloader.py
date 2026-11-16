@@ -4,8 +4,11 @@ Adapter that wraps video_downloader.py for programmatic use.
 Provides a clean API for downloading videos without going through
 the CLI argparse interface.
 """
+import contextlib
 import os
 import re
+import shutil
+import tempfile
 import uuid
 import logging
 
@@ -180,6 +183,11 @@ def _site_cookiefile(domain: str) -> str | None:
         # a directory at this path — isfile() rejects that instead of handing
         # yt-dlp a directory and crashing with "[Errno 21] Is a directory".
         if os.path.isfile(cookies_file):
+            # docker-compose tells you to `touch` the file when you have no
+            # cookies — an empty placeholder means "logged out", not "logged in".
+            if os.path.getsize(cookies_file) == 0:
+                logger.info(f"{name} is empty — proceeding without cookies")
+                return None
             logger.info(f"yt-dlp: using {name}")
             return cookies_file
         if os.path.exists(cookies_file):
@@ -189,6 +197,29 @@ def _site_cookiefile(domain: str) -> str | None:
             )
         return None
     return None
+
+
+@contextlib.contextmanager
+def _ytdlp_cookies(domain: str):
+    """
+    Yield a throwaway copy of the site's cookies file for yt-dlp, or None.
+
+    yt-dlp writes its cookie jar back to `cookiefile` when it closes. Handing it
+    the mounted master file means one bad response (e.g. a Set-Cookie clearing
+    auth_token) silently logs the bot out for every later job.
+    """
+    master = _site_cookiefile(domain)
+    if not master:
+        yield None
+        return
+    fd, tmp = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
+    os.close(fd)
+    try:
+        shutil.copyfile(master, tmp)
+        yield tmp
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 def _get_cdn_referer(domain: str) -> str:
@@ -499,12 +530,10 @@ def _try_ytdlp_twitter(url: str, download_dir: str, progress_callback=None) -> d
         "noplaylist": False,  # Allow all media items in a multi-video tweet
     }
 
-    cookies_file = _site_cookiefile("x.com")
-    if cookies_file:
-        ydl_opts["cookiefile"] = cookies_file
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _ytdlp_cookies("x.com") as cookies_file, yt_dlp.YoutubeDL(
+            {**ydl_opts, "cookiefile": cookies_file}
+        ) as ydl:
             _update("⬇️ Fetching tweet media info...")
             info = ydl.extract_info(url, download=True)
             if info is None:
@@ -637,13 +666,11 @@ def _try_ytdlp(url: str, output_path: str, progress_callback=None) -> dict | Non
     if any(d in _domain for d in FACEBOOK_DOMAINS):
         ydl_opts["format"] = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
 
-    # Use site cookies file if available (needed for auth-gated content)
-    cookies_file = _site_cookiefile(_domain)
-    if cookies_file:
-        ydl_opts["cookiefile"] = cookies_file
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # Use site cookies if available (needed for auth-gated content)
+        with _ytdlp_cookies(_domain) as cookies_file, yt_dlp.YoutubeDL(
+            {**ydl_opts, "cookiefile": cookies_file}
+        ) as ydl:
             logger.debug(f"yt-dlp extract_info start: {url}")
             try:
                 info = ydl.extract_info(url, download=True)
@@ -1672,6 +1699,20 @@ def download_video(
         except Exception as e:
             err_str = str(e).lower()
             if "no video" in err_str or "no formats" in err_str:
+                # Logged out, X strips media from sensitive tweets and yt-dlp
+                # reports that as "No video could be found in this tweet".
+                if _site_cookiefile(domain) is None:
+                    raise RuntimeError(
+                        "No video found. If this tweet does have one, it is probably "
+                        "marked sensitive — X hides that media from logged-out users. "
+                        "Add a twitter_cookies.txt file to the bot's data directory."
+                    )
+                if "/video/" in url:
+                    raise RuntimeError(
+                        "X returned no video even though this link points to one. "
+                        "twitter_cookies.txt is probably logged out or expired — "
+                        "re-export it from a logged-in browser."
+                    )
                 raise RuntimeError("This tweet does not contain a video.")
             elif "login" in err_str or "auth" in err_str or "age" in err_str or "private" in err_str:
                 raise RuntimeError(
