@@ -181,24 +181,61 @@ def fetch_with_playwright(url):
         )
         page = context.new_page()
         video_network_urls = []
+        # URL -> Referer the browser actually sent for it. Stream CDNs often
+        # require the *player iframe's* origin, which the downloader can't guess.
+        request_referers = {}
+        # Counts successful stream loads (manifests / video bodies) so the
+        # play-click logic can tell whether a click started anything.
+        stream_hits = {"n": 0}
+
+        def _remember_referer(u, request):
+            try:
+                ref = request.headers.get("referer")
+            except Exception:
+                ref = None
+            if ref and u not in request_referers:
+                request_referers[u] = ref
 
         def on_response(response):
             u = response.url
-            ct = response.headers.get("content-type", "")
+            ct = response.headers.get("content-type", "").lower()
             status = response.status
+            path = u.lower().split("?")[0]
 
-            # Skip API/GraphQL endpoints — these are data, not video files
+            # A web page is never the video itself — this also stops pages whose
+            # URL merely *ends* in .mp4 (/watch/abc123.mp4) from being captured.
+            if ct.startswith("text/html"):
+                return
+
+            is_manifest = (
+                path.endswith((".m3u8", ".mpd"))
+                or "mpegurl" in ct or "dash+xml" in ct
+            )
+            is_video_body = ct.startswith("video/")
+            if (is_manifest or is_video_body) and 200 <= status < 300:
+                stream_hits["n"] += 1
+
+            # Skip API/GraphQL endpoints — these are data, not video files.
+            # Manifests and video bodies are exempt: players commonly serve
+            # HLS from paths like /api/hls/<id>/master.m3u8.
             skip_patterns = (
                 "/graphql/", "/api/", "/1.1/", "/2/",
                 "api.x.com", "api.twitter.com",
             )
-            if any(pat in u for pat in skip_patterns):
+            if not (is_manifest or is_video_body) and any(pat in u for pat in skip_patterns):
                 return
+
+            before = len(video_network_urls)
 
             # Capture actual video content responses (the real CDN URLs)
             if "video" in ct:
                 video_network_urls.append(u)
                 print(f"    📡 Captured (content-type: {ct}): {u[:80]}...")
+
+            # HLS / DASH manifests (by content-type or extension)
+            elif is_manifest:
+                video_network_urls.append(u)
+                print(f"    📡 Captured (stream manifest): {u[:80]}...")
 
             # Only capture octet-stream if URL looks like a video
             elif "octet-stream" in ct and _looks_like_video(u):
@@ -229,12 +266,17 @@ def fetch_with_playwright(url):
                     video_network_urls.append(resolved)
                     print(f"    📡 Captured (redirect → video): {resolved[:80]}...")
 
+            if len(video_network_urls) > before:
+                _remember_referer(u, response.request)
+
         def on_request(request):
             u = request.url
             # Capture requests with video resource type
             if request.resource_type in ("media", "video"):
+                stream_hits["n"] += 1
                 if u not in video_network_urls:
                     video_network_urls.append(u)
+                    _remember_referer(u, request)
                     print(f"    📡 Captured (media request): {u[:80]}...")
 
         page.on("response", on_response)
@@ -281,124 +323,64 @@ def fetch_with_playwright(url):
                 # Page may have partially loaded — still try to extract
             time.sleep(2)
 
-            # Try multiple selectors to trigger video playback
-            play_selectors = [
-                "video",
-                ".play-btn", ".vjs-big-play-button",
-                "[class*=play]", "[id*=play]",
-                "button[class*=play]", ".video-play",
-                ".player-btn", "[aria-label*=play]",
-            ]
-            for selector in play_selectors:
-                try:
-                    page.click(selector, timeout=1500)
-                    print(f"    ▶️  Clicked: {selector}")
-                    time.sleep(2)
+            # Click play on the page itself (once — re-clicking can reload the
+            # player iframe and burn a single-use embed link).
+            hits_before_click = stream_hits["n"]
+            clicked_frames = [page.main_frame]
+            selector = _click_play_in_frame(page.main_frame)
+            if selector:
+                print(f"    ▶️  Clicked: {selector}")
+                _wait_until(page, lambda: stream_hits["n"] > hits_before_click, 6000)
+
+            # Nothing streaming at all yet? The player probably lives in an
+            # iframe — often one the page click above just created — and needs
+            # its own click. Go up to two iframe levels deep.
+            for _depth in range(2):
+                if stream_hits["n"] > 0:
                     break
-                except Exception:
-                    continue
+                progressed = False
+                for frame in list(page.frames):
+                    if stream_hits["n"] > 0:
+                        break
+                    if any(frame is f for f in clicked_frames) or not _is_player_frame(frame):
+                        continue
+                    selector = _click_play_in_frame(frame)
+                    if not selector:
+                        continue
+                    clicked_frames.append(frame)
+                    progressed = True
+                    print(f"    ▶️  Clicked: {selector} in iframe {frame.url[:60]}")
+                    _wait_until(page, lambda: stream_hits["n"] > 0, 6000)
+                if not progressed:
+                    break
 
             # Wait for video to actually start loading
-            time.sleep(5)
+            page.wait_for_timeout(1500 if stream_hits["n"] > hits_before_click else 5000)
 
-            # Try to extract currentSrc from video elements (the resolved URL)
-            try:
-                js_urls = page.evaluate("""
-                    () => {
-                        const urls = [];
-                        // Standard HTML5 video elements
-                        document.querySelectorAll('video').forEach(v => {
-                            if (v.currentSrc) urls.push(v.currentSrc);
-                            if (v.src) urls.push(v.src);
-                            // Check source elements inside video
-                            v.querySelectorAll('source').forEach(s => {
-                                if (s.src) urls.push(s.src);
-                            });
-                            // data-* attributes (WordPress video plugins, fluid-player, etc.)
-                            ['data-src', 'data-url', 'data-video', 'data-fluid-hd',
-                             'data-mobile-url', 'data-hd-file', 'data-sd-file'].forEach(attr => {
-                                const val = v.getAttribute(attr);
-                                if (val && val.startsWith('http')) urls.push(val);
-                            });
-                        });
-
-                        // Check for common player APIs
-                        if (window.player && window.player.src) urls.push(
-                            typeof window.player.src === 'function'
-                                ? window.player.src() : window.player.src
-                        );
-                        if (window.videoUrl) urls.push(window.videoUrl);
-                        if (window.video_url) urls.push(window.video_url);
-
-                        // Fluid Player — common on WordPress video sites
-                        try {
-                            if (window.fluidPlayer || document.querySelector('.fluid_video_wrapper')) {
-                                document.querySelectorAll('.fluid_video_wrapper video, [id*=fluid] video').forEach(v => {
-                                    if (v.currentSrc) urls.push(v.currentSrc);
-                                    if (v.src) urls.push(v.src);
-                                });
-                            }
-                        } catch(e) {}
-
-                        // JW Player
-                        try {
-                            if (window.jwplayer) {
-                                const jw = jwplayer();
-                                if (jw && jw.getPlaylistItem) {
-                                    const item = jw.getPlaylistItem();
-                                    if (item && item.file) urls.push(item.file);
-                                    if (item && item.sources) {
-                                        item.sources.forEach(s => { if (s.file) urls.push(s.file); });
-                                    }
-                                }
-                            }
-                        } catch(e) {}
-
-                        // DPlayer (common in Chinese sites)
-                        try {
-                            if (window.dp && window.dp.video) {
-                                if (window.dp.video.src) urls.push(window.dp.video.src);
-                            }
-                        } catch(e) {}
-
-                        // Twitter/X: extract from React internal state
-                        try {
-                            const selectors = [
-                                '[data-testid="videoPlayer"] video',
-                                'video[src*="video.twimg"]',
-                                'video[poster*="pbs.twimg"]',
-                            ];
-                            for (const sel of selectors) {
-                                document.querySelectorAll(sel).forEach(v => {
-                                    if (v.src) urls.push(v.src);
-                                    if (v.currentSrc) urls.push(v.currentSrc);
-                                });
-                            }
-                        } catch(e) {}
-
-                        // Generic: search all script tags for video URLs
-                        try {
-                            const scripts = document.querySelectorAll('script');
-                            const genericVideoRegex = /https?:\/\/[^"'\s\\]+\.(?:mp4|m3u8)(?:\?[^"'\s\\]*)*/g;
-                            const twitterRegex = /https?:\/\/video\.twimg\.com\/[^"'\s]+\.mp4[^"'\s]*/g;
-                            scripts.forEach(s => {
-                                if (s.textContent) {
-                                    const mp4Matches = s.textContent.match(genericVideoRegex) || [];
-                                    const twitterMatches = s.textContent.match(twitterRegex) || [];
-                                    urls.push(...mp4Matches, ...twitterMatches);
-                                }
-                            });
-                        } catch(e) {}
-
-                        return [...new Set(urls)];
-                    }
-                """)
-                for js_url in js_urls:
-                    if js_url and js_url not in video_network_urls:
+            # Read what the players report (video currentSrc, player APIs) in
+            # every frame — the real player is often inside an iframe.
+            def _collect_from_frames(script, label):
+                for frame in page.frames:
+                    try:
+                        found = frame.evaluate(script)
+                    except Exception:
+                        continue
+                    for js_url in found or []:
+                        # blob:/data: URLs (MSE playback) can't be downloaded
+                        if not (isinstance(js_url, str) and js_url.startswith("http")):
+                            continue
+                        if js_url in video_network_urls:
+                            continue
                         video_network_urls.append(js_url)
-                        print(f"    📡 Captured (JS runtime): {js_url[:80]}...")
-            except Exception:
-                pass
+                        if frame is not page.main_frame and frame.url.startswith("http"):
+                            request_referers.setdefault(js_url, frame.url)
+                        print(f"    📡 Captured ({label}): {js_url[:80]}...")
+
+            _collect_from_frames(_JS_PLAYER_VIDEO_URLS, "JS runtime")
+            # Grepping inline scripts also picks up related/preview videos, so
+            # only fall back to it when nothing better was found.
+            if not video_network_urls:
+                _collect_from_frames(_JS_SCRIPT_VIDEO_URLS, "inline script")
 
             html = page.content()
             # Deduplicate while preserving order
@@ -418,11 +400,144 @@ def fetch_with_playwright(url):
             cookie_domains = set(c.get("domain", "") for c in cookies)
             print(f"  🍪 Captured {len(cookies)} cookies from domains: {sorted(cookie_domains)}")
             browser.close()
-            return html, video_network_urls, cookies
+            return html, video_network_urls, cookies, request_referers
         except Exception as e:
             print(f"  ❌ Playwright error: {e}")
             browser.close()
-            return None, [], []
+            return None, [], [], {}
+
+
+# Play controls, most specific first. Matching is case-insensitive (" i") so
+# aria-label="Play" and class="vx-play-gate-btn" both hit.
+_PLAY_SELECTORS = (
+    "video",
+    ".vjs-big-play-button", ".jw-display-icon-container", ".plyr__control--overlaid",
+    ".play-btn", ".video-play", ".player-btn",
+    "button[class*=play i]", "button[id*=play i]", "button[aria-label*=play i]",
+    "[aria-label*=play i]", "[class*=play i]", "[id*=play i]",
+)
+
+
+def _click_play_in_frame(frame):
+    """Click the first visible, enabled play control in `frame`.
+
+    Returns the selector that was clicked, or None. Only visible matches are
+    tried, so a hidden "[class*=play]" element earlier in the DOM no longer
+    swallows the click meant for the real button.
+    """
+    for selector in _PLAY_SELECTORS:
+        try:
+            matches = frame.locator(selector)
+            count = min(matches.count(), 5)
+        except Exception:
+            continue
+        for i in range(count):
+            el = matches.nth(i)
+            try:
+                if not el.is_visible() or not el.is_enabled():
+                    continue
+                el.click(timeout=1500)
+                return selector
+            except Exception:
+                continue
+    return None
+
+
+def _is_player_frame(frame):
+    """True for a loaded iframe big enough to hold a video player (skips ad pixels)."""
+    if not frame.url.startswith("http"):
+        return False
+    try:
+        box = frame.frame_element().bounding_box()
+    except Exception:
+        return False
+    return bool(box) and box["width"] >= 200 and box["height"] >= 150
+
+
+def _wait_until(page, predicate, timeout_ms, step_ms=500):
+    """Poll `predicate`, letting Playwright dispatch network events meanwhile."""
+    waited = 0
+    while waited < timeout_ms:
+        if predicate():
+            return True
+        page.wait_for_timeout(step_ms)
+        waited += step_ms
+    return predicate()
+
+
+# Raw strings: these are JavaScript, and Python must not eat the backslashes.
+# (The previous inline version was a plain string, which turned the regex's
+# "\\" into "\" — a JS syntax error that made this whole step a silent no-op.)
+
+# High-precision: what <video> elements and known player APIs are playing.
+_JS_PLAYER_VIDEO_URLS = r"""
+() => {
+    const urls = [];
+    // Standard HTML5 video elements
+    document.querySelectorAll('video').forEach(v => {
+        if (v.currentSrc) urls.push(v.currentSrc);
+        if (v.src) urls.push(v.src);
+        // Check source elements inside video
+        v.querySelectorAll('source').forEach(s => {
+            if (s.src) urls.push(s.src);
+        });
+        // data-* attributes (WordPress video plugins, fluid-player, etc.)
+        ['data-src', 'data-url', 'data-video', 'data-fluid-hd',
+         'data-mobile-url', 'data-hd-file', 'data-sd-file'].forEach(attr => {
+            const val = v.getAttribute(attr);
+            if (val && val.startsWith('http')) urls.push(val);
+        });
+    });
+
+    // Check for common player APIs
+    try {
+        if (window.player && window.player.src) urls.push(
+            typeof window.player.src === 'function'
+                ? window.player.src() : window.player.src
+        );
+    } catch(e) {}
+    if (typeof window.videoUrl === 'string') urls.push(window.videoUrl);
+    if (typeof window.video_url === 'string') urls.push(window.video_url);
+
+    // JW Player
+    try {
+        if (window.jwplayer) {
+            const jw = jwplayer();
+            if (jw && jw.getPlaylistItem) {
+                const item = jw.getPlaylistItem();
+                if (item && item.file) urls.push(item.file);
+                if (item && item.sources) {
+                    item.sources.forEach(s => { if (s.file) urls.push(s.file); });
+                }
+            }
+        }
+    } catch(e) {}
+
+    // DPlayer (common in Chinese sites)
+    try {
+        if (window.dp && window.dp.video && window.dp.video.src) urls.push(window.dp.video.src);
+    } catch(e) {}
+
+    return [...new Set(urls.filter(u => typeof u === 'string'))];
+}
+"""
+
+# Low-precision fallback: any .mp4/.m3u8 URL written into an inline script.
+# Undoes JSON/JS escaping first so "a\/b.m3u8?t=1&s=2" comes out usable.
+_JS_SCRIPT_VIDEO_URLS = r"""
+() => {
+    const urls = [];
+    const generic = /https?:\/\/[^"'\s\\<>]+?\.(?:mp4|m3u8)(?:\?[^"'\s\\<>]*)?/g;
+    const twitter = /https?:\/\/video\.twimg\.com\/[^"'\s\\<>]+\.mp4[^"'\s\\<>]*/g;
+    document.querySelectorAll('script').forEach(s => {
+        let t = s.textContent || '';
+        if (!t) return;
+        t = t.replace(/\\u0026/gi, '&').replace(/\\u002f/gi, '/').replace(/\\\//g, '/');
+        urls.push(...(t.match(generic) || []), ...(t.match(twitter) || []));
+    });
+    return [...new Set(urls)];
+}
+"""
 
 
 # ── Video URL Extraction ─────────────────────────────────────────────────────
@@ -1323,7 +1438,7 @@ def main():
         print("\n[Method 2] Playwright (headless browser)...")
         result = fetch_with_playwright(page_url)
         if result and result[0] is not None:
-            html, network_urls, _ = result
+            html, network_urls = result[0], result[1]
 
     if html is None:
         print("\n❌ Could not fetch the page. Install one of:")

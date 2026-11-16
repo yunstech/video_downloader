@@ -743,13 +743,23 @@ def _download_direct_with_headers(
     output_path: str,
     referer: str = "",
     progress_callback=None,
+    error_out: dict | None = None,
 ) -> dict | None:
     """
     Download a direct video URL with proper browser-like headers.
     Handles CDN URLs that require Referer/User-Agent to avoid 403.
     Supports large files with streaming and progress logging.
+
+    error_out: optional dict; 'reason' is set to 'html' when the URL served a
+        web page rather than a video, so callers can scrape it as a page.
     """
     import requests as req
+    from urllib.parse import urlparse as _urlparse
+
+    def _is_html():
+        if error_out is not None:
+            error_out["reason"] = "html"
+        return None
 
     def _update(text):
         logger.info(text)
@@ -771,7 +781,9 @@ def _download_direct_with_headers(
     }
     if referer:
         headers["Referer"] = referer
-        headers["Origin"] = referer.rstrip("/")
+        _ref = _urlparse(referer)
+        if _ref.scheme and _ref.netloc:
+            headers["Origin"] = f"{_ref.scheme}://{_ref.netloc}"
 
     try:
         _update("⬇️ Downloading video (direct)...")
@@ -789,8 +801,9 @@ def _download_direct_with_headers(
         # Check content-type — if we got HTML, the token probably expired
         content_type = resp.headers.get("content-type", "").lower()
         if "text/html" in content_type:
-            logger.warning("Got HTML response instead of video — token likely expired")
-            return None
+            logger.warning("Got HTML response instead of video (expired token, or a web page)")
+            resp.close()
+            return _is_html()
 
         total_bytes = int(resp.headers.get("content-length", 0))
         bytes_written = 0
@@ -817,7 +830,7 @@ def _download_direct_with_headers(
             if b"<html" in header.lower() or b"<!doctype" in header.lower():
                 logger.warning("Downloaded file is HTML, not video — removing")
                 os.remove(output_path)
-                return None
+                return _is_html()
 
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             return {
@@ -827,8 +840,12 @@ def _download_direct_with_headers(
             }
         elif os.path.exists(output_path):
             file_size = os.path.getsize(output_path)
+            with open(output_path, "rb") as f:
+                header = f.read(512).lower()
             logger.warning(f"Downloaded file too small ({file_size} bytes), removing")
             os.remove(output_path)
+            if b"<html" in header or b"<!doctype" in header:
+                return _is_html()
             return None
 
     except req.exceptions.HTTPError as e:
@@ -1627,34 +1644,43 @@ def download_video(
 
         # Non-m3u8 direct downloads (mp4, webm, etc.)
         # Use proper headers even for generic direct URLs
+        direct_err = {}
         result = _download_direct_with_headers(
-            url, output_path, referer=url, progress_callback=_update
+            url, output_path, referer=url, progress_callback=_update,
+            error_out=direct_err,
         )
         if result:
             _update(f"✅ Download complete! ({result['size_mb']:.1f} MB)")
             return result
 
-        # Fallback: try the original download_direct with a session
-        import requests as req
-        fallback_session = req.Session()
-        fallback_session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        })
+        if direct_err.get("reason") == "html":
+            # Looked like a file (…/abc123.mp4) but is a web page — common
+            # for sites that use video-like paths as watch-page URLs. Handle
+            # it like any other page below instead of failing here.
+            _update("🔎 Link is a web page, not a video file — scanning the page...")
+            logger.info(f"Direct-looking URL served HTML, treating as page: {url}")
+        else:
+            # Fallback: try the original download_direct with a session
+            import requests as req
+            fallback_session = req.Session()
+            fallback_session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            })
 
-        _update("⬇️ Downloading video...")
-        download_direct(url, output_path, url, session=fallback_session)
+            _update("⬇️ Downloading video...")
+            download_direct(url, output_path, url, session=fallback_session)
 
-        if not os.path.exists(output_path):
-            raise RuntimeError("Download completed but output file not found.")
+            if not os.path.exists(output_path):
+                raise RuntimeError("Download completed but output file not found.")
 
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        _update(f"✅ Download complete! ({size_mb:.1f} MB)")
-        result = _validate_downloaded_file(output_path)
-        return result
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            _update(f"✅ Download complete! ({size_mb:.1f} MB)")
+            result = _validate_downloaded_file(output_path)
+            return result
 
     # ── Adult sites: yt-dlp first (knows JS video extraction), scraper fallback ─
     if any(d in domain for d in ADULT_PAGE_DOMAINS):
@@ -1774,13 +1800,15 @@ def download_video(
     session = None
     network_urls = []
     playwright_cookies = []
+    # URL -> Referer the browser sent for it (e.g. the player iframe's URL)
+    network_referers = {}
 
     # Try Playwright first (better for embedded videos, captures real network requests)
     if method in ("auto", "playwright"):
         _update("🌐 Launching headless browser (Playwright)...")
         result = fetch_with_playwright(url)
         if result and result[0] is not None:
-            html, network_urls, playwright_cookies = result
+            html, network_urls, playwright_cookies, network_referers = result
             logger.debug(f"Playwright: got {len(html)} chars HTML, {len(network_urls)} network URLs captured, {len(playwright_cookies)} cookies")
         else:
             logger.debug("Playwright: returned no result")
@@ -1977,6 +2005,8 @@ def download_video(
     )
     if cdn_referer:
         download_referer = cdn_referer
+    if network_referers.get(chosen_url):
+        download_referer = network_referers[chosen_url]
 
     if ".m3u8" in chosen_url.lower():
         if not output_path.lower().endswith((".mp4", ".ts")):
@@ -1992,11 +2022,18 @@ def download_video(
             # Build list of referers to try for this m3u8
             _cdn_ref = _get_cdn_referer(urlparse(m3u8_url).netloc.lower())
             _m3u8_origin = f"{urlparse(m3u8_url).scheme}://{urlparse(m3u8_url).netloc}/"
-            # Try: CDN-mapped referer, page URL, m3u8 origin, no referer
-            _referer = _cdn_ref if _cdn_ref else url
+            # The Referer the browser itself used (often the player iframe,
+            # which we couldn't otherwise guess) beats every heuristic.
+            _browser_ref = network_referers.get(m3u8_url, "")
+            _referer = _browser_ref or _cdn_ref or url
 
-            # Try ffmpeg with: page referer, m3u8 origin, then NO referer (IDM-style)
-            for ff_referer in [_referer, _m3u8_origin, ""]:
+            # Try ffmpeg with: browser/page referer, m3u8 origin, then NO
+            # referer (IDM-style)
+            _ff_referers = [_browser_ref] if _browser_ref else []
+            for _r in (_cdn_ref or url, _m3u8_origin, ""):
+                if _r not in _ff_referers:
+                    _ff_referers.append(_r)
+            for ff_referer in _ff_referers:
                 ff_error = {}
                 success = _download_m3u8_ffmpeg(
                     m3u8_url, output_path, referer=ff_referer,
@@ -2042,8 +2079,8 @@ def download_video(
             # whole job, the remaining candidates and yt-dlp still deserve a go.
             try:
                 success = download_m3u8_native(
-                    m3u8_url, output_path, url, session, workers=workers,
-                    progress_callback=_update,
+                    m3u8_url, output_path, _browser_ref or url, session,
+                    workers=workers, progress_callback=_update,
                 )
             except Exception as e:
                 logger.warning(
